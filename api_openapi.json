@@ -61,14 +61,22 @@
         "operationId": "getStatus",
         "tags": ["Node"],
         "summary": "Daemon status",
-        "description": "Returns node and chain status including peer count, chain height, sync state, and mempool summary.",
+        "description": "Returns node and chain status including peer count, chain height, sync state, mempool summary, and wallet diagnostics (if unlocked).",
         "responses": {
           "200": {
-            "description": "Daemon statistics",
+            "description": "Daemon statistics with optional wallet diagnostics",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DaemonStats"
+                  "allOf": [
+                    { "$ref": "#/components/schemas/DaemonStats" },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "wallet": { "$ref": "#/components/schemas/WalletDiagnostics" }
+                      }
+                    }
+                  ]
                 },
                 "example": {
                   "peer_id": "12D3KooWBLUPjZgAoizTkbNJvHxgHkb2tF1saUhmKBzFfo8zZLfj",
@@ -79,7 +87,21 @@
                   "mempool_size": 3,
                   "mempool_bytes": 4821,
                   "syncing": false,
-                  "identity_age": "2h34m12s"
+                  "identity_age": "2h34m12s",
+                  "wallet": {
+                    "data_version": 1,
+                    "enc_format": "v1",
+                    "kdf_version": 1,
+                    "kdf_memory_mib": 256,
+                    "kdf_iterations": 3,
+                    "kdf_threads": 4,
+                    "created_at": 1710000000,
+                    "view_only": false,
+                    "has_mnemonic": true,
+                    "address_format": "checksummed",
+                    "file_size_bytes": 2048,
+                    "synced_height": 14200
+                  }
                 }
               }
             }
@@ -2669,6 +2691,24 @@
           "mempool_bytes": 4821,
           "syncing": false,
           "identity_age": "2h34m12s"
+        }
+      },
+      "WalletDiagnostics": {
+        "type": "object",
+        "description": "Wallet version and format metadata for troubleshooting. Only present when the wallet is unlocked.",
+        "properties": {
+          "data_version": { "type": "integer", "description": "Wallet data schema version" },
+          "enc_format": { "type": "string", "enum": ["legacy", "v1"], "description": "Encryption envelope format (legacy = no header, v1 = BLKNTWLT header)" },
+          "kdf_version": { "type": "integer", "description": "KDF parameter profile version (0 = legacy 64 MiB, 1 = current 256 MiB)" },
+          "kdf_memory_mib": { "type": "integer", "description": "Argon2id memory cost in MiB" },
+          "kdf_iterations": { "type": "integer", "description": "Argon2id time cost (iterations)" },
+          "kdf_threads": { "type": "integer", "description": "Argon2id parallelism (threads)" },
+          "created_at": { "type": "integer", "description": "Unix timestamp of wallet creation (0 if predates this field)" },
+          "view_only": { "type": "boolean", "description": "True if view-only wallet" },
+          "has_mnemonic": { "type": "boolean", "description": "True if the wallet contains a BIP39 mnemonic" },
+          "address_format": { "type": "string", "enum": ["legacy", "checksummed"], "description": "Address encoding format (legacy = 64-byte no checksum, checksummed = 68-byte with checksum)" },
+          "file_size_bytes": { "type": "integer", "description": "Encrypted wallet file size in bytes" },
+          "synced_height": { "type": "integer", "description": "Last scanned block height" }
         }
       },
       "Block": {

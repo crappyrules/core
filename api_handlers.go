@@ -30,9 +30,19 @@ const (
 // Public handlers (no wallet needed)
 // ============================================================================
 
-// handleStatus returns daemon stats.
+// handleStatus returns daemon stats plus wallet diagnostics (if unlocked).
 func (s *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.daemon.Stats())
+	resp := struct {
+		DaemonStats
+		Wallet *wallet.WalletDiagnostics `json:"wallet,omitempty"`
+	}{
+		DaemonStats: s.daemon.Stats(),
+	}
+	if s.wallet != nil && !s.locked {
+		diag := s.wallet.Diagnostics()
+		resp.Wallet = &diag
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleBlock returns a block by hash (hex) or height (integer).

@@ -55,6 +55,7 @@ func (c *CLI) cmdAbout() {
 func (c *CLI) cmdStatus() {
 	stats := c.daemon.Stats()
 	total, unspent := c.wallet.OutputCount()
+	diag := c.wallet.Diagnostics()
 
 	walletType := "Full"
 	if c.wallet.IsViewOnly() {
@@ -68,6 +69,11 @@ func (c *CLI) cmdStatus() {
 	balanceStr := formatAmount(spendable)
 	if pending > 0 {
 		balanceStr += fmt.Sprintf(" + %s pending", formatAmount(pending))
+	}
+
+	createdStr := "unknown"
+	if diag.CreatedAt > 0 {
+		createdStr = time.Unix(diag.CreatedAt, 0).UTC().Format("2006-01-02 15:04 UTC")
 	}
 
 	fmt.Printf(`
@@ -85,6 +91,11 @@ func (c *CLI) cmdStatus() {
   Outputs:     %d unspent / %d total
   Synced To:   %d
   Address:     %s
+  Data Ver:    %d
+  Enc Format:  %s (KDF v%d, %d MiB, %d iter, %d threads)
+  Addr Format: %s
+  Created:     %s
+  File Size:   %d bytes
 `,
 		c.sectionHead("Node"),
 		stats.PeerID,
@@ -99,6 +110,11 @@ func (c *CLI) cmdStatus() {
 		unspent, total,
 		c.wallet.SyncedHeight(),
 		c.wallet.Address(),
+		diag.DataVersion,
+		diag.EncFormat, diag.KDFVersion, diag.KDFMemoryMiB, diag.KDFIterations, diag.KDFThreads,
+		diag.AddressFormat,
+		createdStr,
+		diag.FileSizeBytes,
 	)
 }
 

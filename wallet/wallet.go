@@ -341,6 +341,32 @@ type ViewOnlyKeys struct {
 	ViewPubKey  [32]byte `json:"view_pub"`
 }
 
+// WalletDiagnostics exposes version and format metadata for troubleshooting.
+type WalletDiagnostics struct {
+	DataVersion   uint32 `json:"data_version"`
+	EncFormat     string `json:"enc_format"`
+	KDFVersion    uint8  `json:"kdf_version"`
+	KDFMemoryMiB  uint32 `json:"kdf_memory_mib"`
+	KDFIterations uint32 `json:"kdf_iterations"`
+	KDFThreads    uint8  `json:"kdf_threads"`
+	CreatedAt     int64  `json:"created_at"`
+	ViewOnly      bool   `json:"view_only"`
+	HasMnemonic   bool   `json:"has_mnemonic"`
+	AddressFormat string `json:"address_format"`
+	FileSizeBytes int64  `json:"file_size_bytes"`
+	SyncedHeight  uint64 `json:"synced_height"`
+}
+
+// encMeta holds encryption envelope metadata captured at load time.
+type encMeta struct {
+	format    string // "legacy" or "v1"
+	kdfVer    uint8
+	kdfTime   uint32
+	kdfMemory uint32 // KiB
+	kdfThread uint8
+	fileSize  int64
+}
+
 // Wallet manages keys and tracks owned outputs
 type Wallet struct {
 	mu sync.RWMutex
@@ -348,6 +374,7 @@ type Wallet struct {
 	data     WalletData
 	filename string
 	password []byte // kept in memory for re-encryption on save
+	enc      encMeta
 
 	// inputReservations tracks outputs reserved for pending spends.
 	// Reservation is best-effort: it prevents concurrent builders from selecting the
@@ -504,7 +531,8 @@ func LoadWallet(filename string, password []byte, cfg WalletConfig) (*Wallet, er
 		return nil, fmt.Errorf("failed to read wallet file: %w", err)
 	}
 
-	// Decrypt
+	em := parseEncMeta(encrypted)
+
 	plaintext, err := decrypt(encrypted, password)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decrypt wallet (wrong password?): %w", err)
@@ -516,13 +544,13 @@ func LoadWallet(filename string, password []byte, cfg WalletConfig) (*Wallet, er
 		return nil, fmt.Errorf("failed to parse wallet data: %w", err)
 	}
 
-	// Avoid long-lived in-memory mnemonic retention; fetch on demand from disk.
 	data.Mnemonic = ""
 
 	return &Wallet{
 		data:                       data,
 		filename:                   filename,
 		password:                   cloneBytes(password),
+		enc:                        em,
 		inputReservations:          make(map[reservedOutpoint]inputReservation),
 		generateStealthKeys:        cfg.GenerateStealthKeys,
 		deriveStealthAddress:       cfg.DeriveStealthAddress,
@@ -606,6 +634,8 @@ func (w *Wallet) Save() error {
 	if err := os.WriteFile(w.filename, encrypted, 0600); err != nil {
 		return fmt.Errorf("failed to write wallet file: %w", err)
 	}
+
+	w.enc = currentEncMeta(int64(len(encrypted)))
 
 	backupWalletFile(w.filename, w.data.Keys.Address())
 	return nil
@@ -1328,6 +1358,36 @@ func (w *Wallet) OutputCount() (total, unspent int) {
 	return
 }
 
+// Diagnostics returns version/format metadata for troubleshooting.
+func (w *Wallet) Diagnostics() WalletDiagnostics {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	addrFmt := "checksummed"
+	addr := w.data.Keys.Address()
+	decoded := base58.Decode(addr)
+	if len(decoded) == 64 {
+		addrFmt = "legacy"
+	}
+
+	hasMnemonic := !w.data.ViewOnly && w.data.Version > 0
+
+	return WalletDiagnostics{
+		DataVersion:   w.data.Version,
+		EncFormat:     w.enc.format,
+		KDFVersion:    w.enc.kdfVer,
+		KDFMemoryMiB:  w.enc.kdfMemory / 1024,
+		KDFIterations: w.enc.kdfTime,
+		KDFThreads:    w.enc.kdfThread,
+		CreatedAt:     w.data.CreatedAt,
+		ViewOnly:      w.data.ViewOnly,
+		HasMnemonic:   hasMnemonic,
+		AddressFormat: addrFmt,
+		FileSizeBytes: w.enc.fileSize,
+		SyncedHeight:  w.data.SyncedHeight,
+	}
+}
+
 // RecordSend stores metadata about an outgoing transaction
 func (w *Wallet) RecordSend(record *SendRecord) {
 	w.mu.Lock()
@@ -1403,6 +1463,35 @@ var (
 		Threads: 4,
 	}
 )
+
+func currentEncMeta(fileSize int64) encMeta {
+	return encMeta{
+		format:    "v1",
+		kdfVer:    defaultKDFParams.Version,
+		kdfTime:   defaultKDFParams.Time,
+		kdfMemory: defaultKDFParams.Memory,
+		kdfThread: defaultKDFParams.Threads,
+		fileSize:  fileSize,
+	}
+}
+
+func parseEncMeta(raw []byte) encMeta {
+	em := encMeta{fileSize: int64(len(raw))}
+	if len(raw) >= walletEncHeaderLenV1+walletEncSaltLen && string(raw[:8]) == walletEncMagicV1 {
+		em.format = "v1"
+		em.kdfVer = raw[9]
+		em.kdfTime = binary.BigEndian.Uint32(raw[10:14])
+		em.kdfMemory = binary.BigEndian.Uint32(raw[14:18])
+		em.kdfThread = raw[18]
+	} else {
+		em.format = "legacy"
+		em.kdfVer = legacyKDFParams.Version
+		em.kdfTime = legacyKDFParams.Time
+		em.kdfMemory = legacyKDFParams.Memory
+		em.kdfThread = legacyKDFParams.Threads
+	}
+	return em
+}
 
 func deriveKeyWithParams(password, salt []byte, p kdfParams) []byte {
 	if p.Time == 0 {

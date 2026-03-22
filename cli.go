@@ -565,7 +565,7 @@ func (c *CLI) printWelcome() {
 
 func fetchLatestVersion() (string, error) {
 	client := &http.Client{Timeout: 8 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, "https://api.github.com/repos/blocknetprivacy/blocknet/releases/latest", nil)
+	req, err := http.NewRequest(http.MethodGet, "https://api.github.com/repos/blocknetprivacy/core/releases/latest", nil)
 	if err != nil {
 		return "", err
 	}
@@ -700,7 +700,7 @@ func (c *CLI) printUpdateNotice(latest string, urgency updateUrgency) {
 	fmt.Printf("\n%s# %s%s\n", accent, title, rst)
 	fmt.Printf("  %sv%s -> v%s%s\n", accent, Version, latest, rst)
 	fmt.Printf("  %s%s%s\n", accent, message, rst)
-	fmt.Printf("  %shttps://github.com/blocknetprivacy/blocknet/releases/latest%s\n", accent, rst)
+	fmt.Printf("  %shttps://github.com/blocknetprivacy/core/releases/latest%s\n", accent, rst)
 }
 
 func (c *CLI) executeCommand(line string) error {

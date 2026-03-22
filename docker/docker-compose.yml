@@ -54,7 +54,7 @@ services:
     restart: unless-stopped
     
     environment:
-      - GITHUB_REPO=blocknetprivacy/blocknet
+      - GITHUB_REPO=blocknetprivacy/core
       - GITHUB_BRANCH=master
       - CHECK_INTERVAL=300  # Check every 5 minutes
       - COMPOSE_PROJECT_DIR=/compose
