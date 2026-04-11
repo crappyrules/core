@@ -1443,7 +1443,7 @@ func (c *Chain) addBlockInternal(block *Block) error {
 	c.bestHash = hash
 	c.height = block.Header.Height
 	c.totalWork = blockWork
-	c.canonicalRingIndexDirty = true
+	c.updateCanonicalRingIndexForConnect([]*Block{block}, hash)
 	c.cacheTrimLocked()
 
 	// Track timestamp for LWMA
@@ -1784,6 +1784,45 @@ func canonicalRingIndexKey(pubKey, commitment [32]byte) [64]byte {
 	return key
 }
 
+// updateCanonicalRingIndexForConnect incrementally adds outputs from newly
+// connected blocks to the canonical ring index. Falls back to marking dirty
+// if the index hasn't been initialized yet (cold start).
+func (c *Chain) updateCanonicalRingIndexForConnect(blocks []*Block, newTip [32]byte) {
+	if !c.canonicalRingIndexReady {
+		c.canonicalRingIndexDirty = true
+		return
+	}
+	for _, block := range blocks {
+		for _, tx := range block.Transactions {
+			for _, out := range tx.Outputs {
+				key := canonicalRingIndexKey(out.PublicKey, out.Commitment)
+				c.canonicalRingIndex[key] = struct{}{}
+				if _, exists := c.canonicalRingHeights[key]; !exists {
+					c.canonicalRingHeights[key] = block.Header.Height
+				}
+			}
+		}
+	}
+	c.canonicalRingIndexTip = newTip
+}
+
+// updateCanonicalRingIndexForDisconnect removes outputs belonging to
+// disconnected blocks from the canonical ring index during a reorg.
+func (c *Chain) updateCanonicalRingIndexForDisconnect(blocks []*Block) {
+	if !c.canonicalRingIndexReady {
+		return
+	}
+	for _, block := range blocks {
+		for _, tx := range block.Transactions {
+			for _, out := range tx.Outputs {
+				key := canonicalRingIndexKey(out.PublicKey, out.Commitment)
+				delete(c.canonicalRingIndex, key)
+				delete(c.canonicalRingHeights, key)
+			}
+		}
+	}
+}
+
 func (c *Chain) ensureCanonicalRingIndexLocked() error {
 	tipHash, tipHeight, _, found := c.storage.GetTip()
 	if !found {
@@ -1945,7 +1984,7 @@ func (c *Chain) reorganizeTo(newTip [32]byte) error {
 				}
 			}
 		}
-		c.canonicalRingIndexDirty = true
+		c.updateCanonicalRingIndexForConnect([]*Block{newBlock}, newTip)
 		c.cacheTrimLocked()
 		return nil
 	}
@@ -2032,7 +2071,8 @@ func (c *Chain) reorganizeTo(newTip [32]byte) error {
 	c.bestHash = newTip
 	c.height = newBlock.Header.Height
 	c.totalWork = newTipWork
-	c.canonicalRingIndexDirty = true
+	c.updateCanonicalRingIndexForDisconnect(disconnect)
+	c.updateCanonicalRingIndexForConnect(connect, newTip)
 	c.cacheTouchLocked(newTip)
 	c.cacheTrimLocked()
 
@@ -2415,11 +2455,20 @@ func (c *Chain) IsFinalized(height uint64) bool {
 // whether it was found.
 func (c *Chain) FindTxByHashStr(hashStr string) (*Transaction, uint64, bool) {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
+	tipHeight := c.height
+	c.mu.RUnlock()
 
-	for h := c.height; ; h-- {
-		block := c.getBlockByHeightLocked(h)
-		if block == nil {
+	for h := tipHeight; ; h-- {
+		hash, found := c.storage.GetBlockHashByHeight(h)
+		if !found {
+			if h == 0 {
+				break
+			}
+			continue
+		}
+
+		block, err := c.storage.GetBlock(hash)
+		if err != nil || block == nil {
 			if h == 0 {
 				break
 			}

@@ -1077,11 +1077,35 @@ func (c *CLI) createTxBuilder() *wallet.Builder {
 // autoScanBlocks subscribes to new blocks and scans them for wallet outputs
 func (c *CLI) autoScanBlocks() {
 	blockCh := c.daemon.SubscribeBlocks()
+	const saveBatchSize = 50
+	unsaved := 0
+	saveTimer := time.NewTimer(10 * time.Second)
+	defer saveTimer.Stop()
+
+	doSave := func() {
+		if unsaved == 0 {
+			return
+		}
+		c.mu.RLock()
+		w := c.wallet
+		c.mu.RUnlock()
+		if w == nil {
+			return
+		}
+		if err := w.Save(); err != nil {
+			fmt.Printf("  Warning: failed to persist wallet scan updates: %v\n", err)
+		}
+		unsaved = 0
+		saveTimer.Reset(10 * time.Second)
+	}
 
 	for {
 		select {
 		case <-c.ctx.Done():
+			doSave()
 			return
+		case <-saveTimer.C:
+			doSave()
 		case block := <-blockCh:
 			if block == nil {
 				continue
@@ -1103,8 +1127,9 @@ func (c *CLI) autoScanBlocks() {
 			})
 
 			w.SetSyncedHeight(blockData.Height)
-			if err := w.Save(); err != nil {
-				fmt.Printf("  Warning: failed to persist wallet scan updates: %v\n", err)
+			unsaved++
+			if unsaved >= saveBatchSize {
+				doSave()
 			}
 		}
 	}

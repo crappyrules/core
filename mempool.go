@@ -84,12 +84,6 @@ func NewMempool(cfg MempoolConfig, isSpent KeyImageChecker, isCanonicalRingMembe
 
 // AddTransaction adds a transaction to the mempool.
 func (m *Mempool) AddTransaction(tx *Transaction, txData []byte) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Fail closed on non-canonical tx bytes (including trailing junk).
-	// Most ingress paths already call DeserializeTx before AddTransaction, but
-	// mempool is a safety boundary and should only accept canonical txData.
 	parsedTx, err := DeserializeTx(txData)
 	if err != nil {
 		return fmt.Errorf("invalid transaction data: %w", err)
@@ -104,40 +98,37 @@ func (m *Mempool) AddTransaction(tx *Transaction, txData []byte) error {
 		return fmt.Errorf("failed to get tx ID: %w", err)
 	}
 
-	// Check if already in mempool
-	if _, exists := m.txByID[txID]; exists {
-		return nil // Already have it
+	if err := ValidateTransaction(parsedTx, m.isKeyImageSpent, m.isCanonicalRingMember); err != nil {
+		return fmt.Errorf("validation failed: %w", err)
 	}
 
-	// Check for double-spend with mempool txs
+	size := len(txData)
+	feeRate := tx.Fee / uint64(size)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, exists := m.txByID[txID]; exists {
+		return nil
+	}
+
 	for _, input := range parsedTx.Inputs {
 		if existingTxID, exists := m.txByImage[input.KeyImage]; exists {
 			return fmt.Errorf("double-spend: key image already in mempool (tx %x...)", existingTxID[:8])
 		}
 	}
 
-	// Validate against UTXO set (doesn't modify it)
-	if err := ValidateTransaction(parsedTx, m.isKeyImageSpent, m.isCanonicalRingMember); err != nil {
-		return fmt.Errorf("validation failed: %w", err)
-	}
-
-	// Calculate fee rate
-	size := len(txData)
-	feeRate := tx.Fee / uint64(size)
 	if feeRate < m.config.MinFeeRate {
 		return fmt.Errorf("fee rate too low: %d < %d", feeRate, m.config.MinFeeRate)
 	}
 
-	// Check mempool limits
 	if len(m.txByID) >= m.config.MaxSize {
-		// Try to evict lowest fee rate tx
 		if !m.evictLowest(feeRate) {
 			return fmt.Errorf("mempool full")
 		}
 	}
 
 	if m.totalSize+size > m.config.MaxSizeBytes {
-		// Try to make room
 		for m.totalSize+size > m.config.MaxSizeBytes && len(m.priorityQueue) > 0 {
 			if !m.evictLowest(feeRate) {
 				return fmt.Errorf("mempool size limit exceeded")
@@ -145,7 +136,6 @@ func (m *Mempool) AddTransaction(tx *Transaction, txData []byte) error {
 		}
 	}
 
-	// Add to mempool
 	entry := &MempoolEntry{
 		Tx:      parsedTx,
 		TxID:    txID,

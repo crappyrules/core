@@ -86,36 +86,42 @@ func (c *idempotencyCache) getOrStart(now time.Time, key string, reqHash [32]byt
 
 func (c *idempotencyCache) complete(now time.Time, key string, reqHash [32]byte, status int, body []byte) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	c.pruneLocked(now)
 
 	e, ok := c.entries[key]
 	if !ok {
+		c.mu.Unlock()
 		return
 	}
 	if e.reqHash != reqHash {
-		// If the key was somehow reused with a different request, don't cache a response.
 		delete(c.entries, key)
+		c.mu.Unlock()
 		return
 	}
 	e.createdAt = now
 	e.inFlight = false
 	e.result = idempotencyResult{status: status, body: append([]byte(nil), body...)}
 	c.enforceCapLocked()
-	if err := c.persistLocked(); err != nil {
+	data, path := c.snapshotForPersist()
+	c.mu.Unlock()
+
+	if err := writePersistData(data, path); err != nil {
 		log.Printf("Warning: failed to persist idempotency cache: %v", err)
 	}
 }
 
 func (c *idempotencyCache) abandon(key string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if _, ok := c.entries[key]; !ok {
+		c.mu.Unlock()
 		return
 	}
 	delete(c.entries, key)
-	if err := c.persistLocked(); err != nil {
+	data, path := c.snapshotForPersist()
+	c.mu.Unlock()
+
+	if err := writePersistData(data, path); err != nil {
 		log.Printf("Warning: failed to persist idempotency cache: %v", err)
 	}
 }
@@ -215,9 +221,11 @@ func (c *idempotencyCache) loadPersisted() {
 	c.enforceCapLocked()
 }
 
-func (c *idempotencyCache) persistLocked() error {
+// snapshotForPersist marshals current entries under the lock and returns
+// the serialized bytes plus the persist path. Caller must hold c.mu.
+func (c *idempotencyCache) snapshotForPersist() ([]byte, string) {
 	if c.persistPath == "" {
-		return nil
+		return nil, ""
 	}
 
 	persisted := persistedIdempotencyState{
@@ -234,19 +242,20 @@ func (c *idempotencyCache) persistLocked() error {
 			BodyBase64:        base64.StdEncoding.EncodeToString(entry.result.body),
 		}
 	}
+	data, _ := json.Marshal(persisted)
+	return data, c.persistPath
+}
 
-	if err := os.MkdirAll(filepath.Dir(c.persistPath), 0o700); err != nil {
+func writePersistData(data []byte, path string) error {
+	if path == "" || data == nil {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-
-	data, err := json.Marshal(persisted)
-	if err != nil {
-		return err
-	}
-
-	tmpPath := c.persistPath + ".tmp"
+	tmpPath := path + ".tmp"
 	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, c.persistPath)
+	return os.Rename(tmpPath, path)
 }

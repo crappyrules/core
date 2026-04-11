@@ -407,6 +407,24 @@ func (s *Storage) CommitBlock(commit *BlockCommit) error {
 		return err
 	}
 
+	type serializedOutput struct {
+		key  []byte
+		data []byte
+	}
+	var outputEntries []serializedOutput
+	if commit.IsMainTip {
+		for _, out := range commit.NewOutputs {
+			data, err := json.Marshal(out)
+			if err != nil {
+				return err
+			}
+			outputEntries = append(outputEntries, serializedOutput{
+				key:  outpointKey(out.TxID, out.OutputIndex),
+				data: data,
+			})
+		}
+	}
+
 	heightBytes := heightKey(commit.Height)
 
 	return s.db.Update(func(tx *bolt.Tx) error {
@@ -440,38 +458,27 @@ func (s *Storage) CommitBlock(commit *BlockCommit) error {
 			}
 		}
 
-		// Store block
 		if err := blocks.Put(commit.Hash[:], blockData); err != nil {
 			return err
 		}
 
-		// If this is the new main chain tip
 		if commit.IsMainTip {
-			// Set height -> hash mapping
 			if err := heights.Put(heightBytes, commit.Hash[:]); err != nil {
 				return err
 			}
 
-			// Add new outputs (never deleted)
-			for _, out := range commit.NewOutputs {
-				key := outpointKey(out.TxID, out.OutputIndex)
-				data, err := json.Marshal(out)
-				if err != nil {
-					return err
-				}
-				if err := outputs.Put(key, data); err != nil {
+			for _, entry := range outputEntries {
+				if err := outputs.Put(entry.key, entry.data); err != nil {
 					return err
 				}
 			}
 
-			// Mark key images as spent
 			for _, ki := range commit.SpentKeyImgs {
 				if err := keyImages.Put(ki[:], heightBytes); err != nil {
 					return err
 				}
 			}
 
-			// Update tip metadata
 			workBytes := make([]byte, 8)
 			binary.BigEndian.PutUint64(workBytes, commit.Work)
 
@@ -509,6 +516,50 @@ func (s *Storage) CommitReorg(commit *ReorgCommit) error {
 	}
 	if len(commit.Connect) == 0 {
 		return fmt.Errorf("reorg commit requires at least one block to connect")
+	}
+
+	type serializedOutput struct {
+		key  []byte
+		data []byte
+	}
+	type serializedBlock struct {
+		hash    [32]byte
+		height  uint64
+		data    []byte
+		outputs []serializedOutput
+	}
+
+	prepared := make([]serializedBlock, len(commit.Connect))
+	for i, block := range commit.Connect {
+		blockData, err := json.Marshal(block)
+		if err != nil {
+			return fmt.Errorf("failed to marshal block: %w", err)
+		}
+		sb := serializedBlock{
+			hash:   block.Hash(),
+			height: block.Header.Height,
+			data:   blockData,
+		}
+		for _, txn := range block.Transactions {
+			txid, _ := txn.TxID()
+			for idx, out := range txn.Outputs {
+				newOutput := &UTXO{
+					TxID:        txid,
+					OutputIndex: uint32(idx),
+					Output:      out,
+					BlockHeight: block.Header.Height,
+				}
+				data, err := json.Marshal(newOutput)
+				if err != nil {
+					return fmt.Errorf("failed to marshal output: %w", err)
+				}
+				sb.outputs = append(sb.outputs, serializedOutput{
+					key:  outpointKey(txid, uint32(idx)),
+					data: data,
+				})
+			}
+		}
+		prepared[i] = sb
 	}
 
 	return s.db.Update(func(tx *bolt.Tx) error {
@@ -619,47 +670,25 @@ func (s *Storage) CommitReorg(commit *ReorgCommit) error {
 			// Ring selection filters to canonical-only via IsCanonicalRingMember.
 		}
 
-		// Connect new blocks (forward order)
-		for _, block := range commit.Connect {
-			hKey := heightKey(block.Header.Height)
-			hash := block.Hash()
+		// Connect new blocks (forward order) using pre-serialized data
+		for i, sb := range prepared {
+			block := commit.Connect[i]
+			hKey := heightKey(sb.height)
 
-			// Save block data
-			blockData, err := json.Marshal(block)
-			if err != nil {
-				return fmt.Errorf("failed to marshal block: %w", err)
-			}
-			if err := blocks.Put(hash[:], blockData); err != nil {
+			if err := blocks.Put(sb.hash[:], sb.data); err != nil {
 				return fmt.Errorf("failed to save block: %w", err)
 			}
 
-			// Add to height index
-			if err := heights.Put(hKey, hash[:]); err != nil {
+			if err := heights.Put(hKey, sb.hash[:]); err != nil {
 				return err
 			}
 
-			// Add outputs
-			for _, txn := range block.Transactions {
-				txid, _ := txn.TxID()
-				for idx, out := range txn.Outputs {
-					newOutput := &UTXO{
-						TxID:        txid,
-						OutputIndex: uint32(idx),
-						Output:      out,
-						BlockHeight: block.Header.Height,
-					}
-					data, err := json.Marshal(newOutput)
-					if err != nil {
-						return fmt.Errorf("failed to marshal output: %w", err)
-					}
-					key := outpointKey(txid, uint32(idx))
-					if err := outputs.Put(key, data); err != nil {
-						return err
-					}
+			for _, entry := range sb.outputs {
+				if err := outputs.Put(entry.key, entry.data); err != nil {
+					return err
 				}
 			}
 
-			// Mark key images as spent
 			for _, txn := range block.Transactions {
 				if !txn.IsCoinbase() {
 					for _, input := range txn.Inputs {

@@ -130,29 +130,26 @@ func (d *DandelionRouter) BroadcastTx(data []byte) {
 	hash := sha256.Sum256(data)
 
 	d.mu.Lock()
-	defer d.mu.Unlock()
 
-	// Check if we've already seen this tx
 	if _, exists := d.txCache[hash]; exists {
+		d.mu.Unlock()
 		return
 	}
 
-	// Create record
 	rec := &txRecord{
 		hash:      hash,
 		data:      data,
 		state:     TxStateStem,
 		createdAt: time.Now(),
-		fromPeer:  d.node.PeerID(), // From us
+		fromPeer:  d.node.PeerID(),
 	}
 
-	// Get stem peer for this epoch
 	stemPeer := d.getOutboundStemPeer()
 	if stemPeer == "" {
-		// No stem peer available, go directly to fluff
 		rec.state = TxStateFluff
 		d.txCache[hash] = rec
 		d.enforceTxCacheLimitLocked()
+		d.mu.Unlock()
 		d.fluffTx(rec)
 		return
 	}
@@ -160,8 +157,8 @@ func (d *DandelionRouter) BroadcastTx(data []byte) {
 	rec.stemPeer = stemPeer
 	d.txCache[hash] = rec
 	d.enforceTxCacheLimitLocked()
+	d.mu.Unlock()
 
-	// Send via stem
 	d.sendStemAsync(stemPeer, data)
 }
 
@@ -192,15 +189,12 @@ func (d *DandelionRouter) handleStemTx(from peer.ID, data []byte) {
 	hash := sha256.Sum256(data)
 
 	d.mu.Lock()
-	defer d.mu.Unlock()
 
-	// Check if already seen
 	if _, exists := d.txCache[hash]; exists {
+		d.mu.Unlock()
 		return
 	}
 
-	// Decide: continue stem or fluff? (crypto/rand for privacy)
-	// On RNG failure, fail open to fluff to preserve liveness.
 	randFloat, randErr := cryptoRandFloat64()
 	shouldFluff := randErr != nil || randFloat > StemProbability
 
@@ -212,22 +206,20 @@ func (d *DandelionRouter) handleStemTx(from peer.ID, data []byte) {
 	}
 
 	if shouldFluff {
-		// Transition to fluff phase
 		rec.state = TxStateFluff
 		d.txCache[hash] = rec
 		d.enforceTxCacheLimitLocked()
+		d.mu.Unlock()
 		d.fluffTx(rec)
 	} else {
-		// Continue stem to next hop
 		rec.state = TxStateStem
 
-		// Get a stem peer that's not the sender
 		stemPeer := d.getStemPeerExcluding(from)
 		if stemPeer == "" {
-			// No other stem peer, fluff
 			rec.state = TxStateFluff
 			d.txCache[hash] = rec
 			d.enforceTxCacheLimitLocked()
+			d.mu.Unlock()
 			d.fluffTx(rec)
 			return
 		}
@@ -235,6 +227,7 @@ func (d *DandelionRouter) handleStemTx(from peer.ID, data []byte) {
 		rec.stemPeer = stemPeer
 		d.txCache[hash] = rec
 		d.enforceTxCacheLimitLocked()
+		d.mu.Unlock()
 
 		d.sendStemAsync(stemPeer, data)
 	}

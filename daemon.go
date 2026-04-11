@@ -659,11 +659,11 @@ func (d *Daemon) handleBlock(from peer.ID, data []byte) {
 	defer d.releaseGossipBlockValidationSlot()
 
 	d.mu.Lock()
-	defer d.mu.Unlock()
 
 	prevBest := d.chain.BestHash()
 	accepted, isMainChain, err := d.chain.ProcessBlock(&block)
 	if err != nil || !accepted {
+		d.mu.Unlock()
 		if err != nil {
 			log.Printf("Rejected announced block at height %d from %s: %v", block.Header.Height, from.String()[:8], err)
 			d.penalizeInvalidGossipPeer(from, p2p.ScorePenaltyMisbehave, fmt.Sprintf("invalid block: %v", err))
@@ -672,19 +672,17 @@ func (d *Daemon) handleBlock(from peer.ID, data []byte) {
 	}
 
 	if !isMainChain {
+		d.mu.Unlock()
 		return
 	}
 
 	d.updateMempoolForAcceptedMainChain(&block, prevBest)
-	d.maybeAppendCheckpointLocked(&block)
+	cp := d.prepareCheckpointLocked(&block)
+	d.mu.Unlock()
 
-	// Relay to other peers (exclude sender)
+	writeCheckpoint(cp)
 	d.node.RelayBlock(from, data)
-
-	// Notify wallet subscribers
 	d.notifyBlock(&block)
-
-	// Signal miner to restart with new tip
 	d.miner.NotifyNewBlock()
 }
 
@@ -880,59 +878,80 @@ func (d *Daemon) processBlockData(data []byte) error {
 	}
 
 	d.mu.Lock()
-	defer d.mu.Unlock()
 
 	prevBest := d.chain.BestHash()
 	accepted, isMainChain, err := d.chain.ProcessBlock(&block)
 	if err != nil {
+		d.mu.Unlock()
 		return fmt.Errorf("rejected p2p block at height %d: %w", block.Header.Height, err)
 	}
 	if !accepted {
+		d.mu.Unlock()
 		return ErrDuplicateBlock
 	}
 
 	if !isMainChain {
+		d.mu.Unlock()
 		return ErrSideChainBlock
 	}
 
 	d.updateMempoolForAcceptedMainChain(&block, prevBest)
-	d.maybeAppendCheckpointLocked(&block)
+	cp := d.prepareCheckpointLocked(&block)
+	d.mu.Unlock()
+
+	writeCheckpoint(cp)
 	return nil
 }
 
-func (d *Daemon) maybeAppendCheckpointLocked(block *Block) {
+type checkpointEntry struct {
+	height uint64
+	line   string
+	file   string
+}
+
+// prepareCheckpointLocked checks whether a checkpoint should be written and
+// returns the entry to write. Caller must hold d.mu. The actual file I/O
+// should happen after releasing d.mu via writeCheckpoint.
+func (d *Daemon) prepareCheckpointLocked(block *Block) *checkpointEntry {
 	if !d.saveCheckpoints || block == nil {
-		return
+		return nil
 	}
 	h := block.Header.Height
 	if h == 0 || (h%100) != 0 {
-		return
+		return nil
 	}
 	if h <= d.lastCheckpointWritten {
-		return
+		return nil
 	}
 	if d.checkpointsFile == "" {
+		return nil
+	}
+	hash := block.Hash()
+	d.lastCheckpointWritten = h
+	return &checkpointEntry{
+		height: h,
+		line:   fmt.Sprintf("%d:%s\n", h, strings.ToUpper(hex.EncodeToString(hash[:]))),
+		file:   d.checkpointsFile,
+	}
+}
+
+func writeCheckpoint(entry *checkpointEntry) {
+	if entry == nil {
 		return
 	}
-
-	if err := os.MkdirAll(filepath.Dir(d.checkpointsFile), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(entry.file), 0o755); err != nil {
 		log.Printf("Warning: failed to create checkpoints dir: %v", err)
 		return
 	}
-	f, err := os.OpenFile(d.checkpointsFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(entry.file, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		log.Printf("Warning: failed to append checkpoint: %v", err)
 		return
 	}
 	defer f.Close()
-
-	hash := block.Hash()
-	line := fmt.Sprintf("%d:%s\n", h, strings.ToUpper(hex.EncodeToString(hash[:]))) // matches repo format examples
-	if _, err := io.WriteString(f, line); err != nil {
+	if _, err := io.WriteString(f, entry.line); err != nil {
 		log.Printf("Warning: failed to write checkpoint: %v", err)
-		return
 	}
-	d.lastCheckpointWritten = h
 }
 
 // updateMempoolForAcceptedMainChain updates mempool contents for a newly
@@ -1214,12 +1233,15 @@ func (d *Daemon) SubmitBlock(block *Block) error {
 		return fmt.Errorf("block not accepted (duplicate or stale)")
 	}
 
+	var cp *checkpointEntry
 	if isMainChain {
 		d.updateMempoolForAcceptedMainChain(block, prevBest)
-		d.maybeAppendCheckpointLocked(block)
+		cp = d.prepareCheckpointLocked(block)
 		d.miner.NotifyNewBlock()
 	}
 	d.mu.Unlock()
+
+	writeCheckpoint(cp)
 
 	// Broadcast to peers
 	blockData, err := json.Marshal(block)

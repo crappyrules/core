@@ -609,16 +609,16 @@ func LoadOrCreateWallet(filename string, password []byte, cfg WalletConfig) (*Wa
 // Save encrypts and writes wallet to disk
 func (w *Wallet) Save() error {
 	w.mu.RLock()
-	defer w.mu.RUnlock()
-
 	dataToPersist := w.data
-	// Mnemonic is intentionally not kept in the long-lived wallet struct; preserve
-	// any on-disk mnemonic so future saves don't erase it.
 	if !dataToPersist.ViewOnly && dataToPersist.Mnemonic == "" {
 		if mnemonic, err := w.readMnemonicFromDisk(); err == nil && mnemonic != "" {
 			dataToPersist.Mnemonic = mnemonic
 		}
 	}
+	password := w.password
+	filename := w.filename
+	address := w.data.Keys.Address()
+	w.mu.RUnlock()
 
 	plaintext, err := json.MarshalIndent(dataToPersist, "", "  ")
 	if err != nil {
@@ -626,18 +626,21 @@ func (w *Wallet) Save() error {
 	}
 	defer wipeBytes(plaintext)
 
-	encrypted, err := encrypt(plaintext, w.password)
+	encrypted, err := encrypt(plaintext, password)
 	if err != nil {
 		return fmt.Errorf("failed to encrypt wallet: %w", err)
 	}
 
-	if err := os.WriteFile(w.filename, encrypted, 0600); err != nil {
+	if err := os.WriteFile(filename, encrypted, 0600); err != nil {
 		return fmt.Errorf("failed to write wallet file: %w", err)
 	}
 
-	w.enc = currentEncMeta(int64(len(encrypted)))
+	encMeta := currentEncMeta(int64(len(encrypted)))
+	w.mu.Lock()
+	w.enc = encMeta
+	w.mu.Unlock()
 
-	backupWalletFile(w.filename, w.data.Keys.Address())
+	backupWalletFile(filename, address)
 	return nil
 }
 
