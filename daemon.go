@@ -1160,17 +1160,14 @@ type DaemonStats struct {
 }
 
 func (d *Daemon) Stats() DaemonStats {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	bestHash := d.chain.BestHash()
+	height, bestHash, totalWork := d.chain.TipFast()
 
 	stats := DaemonStats{
 		PeerID:       d.node.PeerID().String(),
 		Peers:        len(d.node.Peers()),
-		ChainHeight:  d.chain.Height(),
+		ChainHeight:  height,
 		BestHash:     fmt.Sprintf("%x", bestHash[:8]),
-		TotalWork:    d.chain.TotalWork(),
+		TotalWork:    totalWork,
 		MempoolSize:  d.mempool.Size(),
 		MempoolBytes: d.mempool.SizeBytes(),
 		Syncing:      d.syncMgr.IsSyncing(),

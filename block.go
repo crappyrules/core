@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"blocknet/protocol/params"
@@ -932,6 +933,10 @@ func computeLWMA(blocks []*Block, height uint64) uint64 {
 type Chain struct {
 	mu sync.RWMutex
 
+	// tipSnap is published under mu on every tip change and read lock-free
+	// by Stats(), so the API never blocks behind block processing.
+	tipSnap atomic.Pointer[tipSnapshot]
+
 	// Persistent storage (bbolt)
 	storage *Storage
 
@@ -1132,6 +1137,7 @@ func (c *Chain) loadFromStorage() error {
 	c.bestHash = tipHash
 	c.height = tipHeight
 	c.totalWork = tipWork
+	c.publishTipLocked()
 
 	// Load recent blocks for LWMA calculation and height index
 	startHeight := uint64(0)
@@ -1236,6 +1242,24 @@ func (c *Chain) Storage() *Storage {
 }
 
 // Height returns current chain height
+type tipSnapshot struct {
+	height    uint64
+	bestHash  [32]byte
+	totalWork uint64
+}
+
+func (c *Chain) publishTipLocked() {
+	c.tipSnap.Store(&tipSnapshot{height: c.height, bestHash: c.bestHash, totalWork: c.totalWork})
+}
+
+// TipFast returns the chain tip without taking any lock.
+func (c *Chain) TipFast() (uint64, [32]byte, uint64) {
+	if s := c.tipSnap.Load(); s != nil {
+		return s.height, s.bestHash, s.totalWork
+	}
+	return 0, [32]byte{}, 0
+}
+
 func (c *Chain) Height() uint64 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -1457,6 +1481,7 @@ func (c *Chain) addBlockInternal(block *Block) error {
 	c.bestHash = hash
 	c.height = block.Header.Height
 	c.totalWork = blockWork
+	c.publishTipLocked()
 	c.updateCanonicalRingIndexForConnect([]*Block{block}, hash)
 	c.cacheTrimLocked()
 
@@ -2011,6 +2036,7 @@ func (c *Chain) reorganizeTo(newTip [32]byte) error {
 		c.bestHash = newTip
 		c.height = newBlock.Header.Height
 		c.totalWork = newTipWork
+		c.publishTipLocked()
 		c.byHeight[newBlock.Header.Height] = newTip
 		c.cacheTouchLocked(newTip)
 		c.timestamps = append(c.timestamps, newBlock.Header.Timestamp)
@@ -2111,6 +2137,7 @@ func (c *Chain) reorganizeTo(newTip [32]byte) error {
 	c.bestHash = newTip
 	c.height = newBlock.Header.Height
 	c.totalWork = newTipWork
+	c.publishTipLocked()
 	c.updateCanonicalRingIndexForDisconnect(disconnect)
 	c.updateCanonicalRingIndexForConnect(connect, newTip)
 	c.cacheTouchLocked(newTip)
@@ -2328,6 +2355,7 @@ func (c *Chain) TruncateToHeight(keepHeight uint64) error {
 	c.bestHash = newHash
 	c.height = keepHeight
 	c.totalWork = newWork
+	c.publishTipLocked()
 	c.canonicalRingIndexDirty = true
 	c.cacheTouchLocked(newHash)
 	c.cacheTrimLocked()
