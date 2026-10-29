@@ -1,57 +1,32 @@
 //! Scratch memory for the fixed Argon2id kernel.
 //!
-//! Cache at most one idle arena (2 GiB at production parameters). Concurrent
-//! callers still own separate arenas; surplus arenas are released on return.
+//! Release each arena after hashing so validators do not retain 2 GiB of
+//! scratch memory between block checks.
 
 use blocknet_pow_kernel::PowBlock as Block;
-use std::sync::Mutex;
-
 pub(crate) struct MemoryPool {
     blocks: usize,
-    idle: Mutex<Option<Memory>>,
 }
 
 impl MemoryPool {
     pub(crate) fn new(blocks: usize) -> Self {
-        Self {
-            blocks,
-            idle: Mutex::new(None),
-        }
+        Self { blocks }
     }
 
-    pub(crate) fn checkout(&self) -> Result<MemoryGuard<'_>, ()> {
-        let cached = self.idle.lock().map_err(|_| ())?.take();
-        // Allocate outside the lock so a slow allocation does not block returns.
-        let memory = match cached {
-            Some(memory) => memory,
-            None => Memory::new(self.blocks)?,
-        };
+    pub(crate) fn checkout(&self) -> Result<MemoryGuard, ()> {
         Ok(MemoryGuard {
-            pool: self,
-            memory: Some(memory),
+            memory: Memory::new(self.blocks)?,
         })
     }
 }
 
-pub(crate) struct MemoryGuard<'a> {
-    pool: &'a MemoryPool,
-    memory: Option<Memory>,
+pub(crate) struct MemoryGuard {
+    memory: Memory,
 }
 
-impl AsMut<[Block]> for MemoryGuard<'_> {
+impl AsMut<[Block]> for MemoryGuard {
     fn as_mut(&mut self) -> &mut [Block] {
-        self.memory.as_mut().expect("checked-out arena").as_mut()
-    }
-}
-
-impl Drop for MemoryGuard<'_> {
-    fn drop(&mut self) {
-        if let Ok(mut idle) = self.pool.idle.lock() {
-            if idle.is_none() {
-                *idle = self.memory.take();
-            }
-        }
-        // Any surplus arena is freed after the cache lock is released.
+        self.memory.as_mut()
     }
 }
 
@@ -169,7 +144,7 @@ mod tests {
     use blocknet_pow_kernel::{CpuKernel, FixedArgon2id};
 
     #[test]
-    fn reuse_and_concurrent_checkouts_keep_only_one_idle_arena() {
+    fn concurrent_checkouts_have_separate_arenas() {
         let pool = MemoryPool::new(32);
         let mut a = pool.checkout().unwrap();
         let ptr = a.as_mut().as_ptr();
@@ -177,11 +152,6 @@ mod tests {
         assert_ne!(ptr, b.as_mut().as_ptr());
         drop(a);
         drop(b);
-        let mut reused = pool.checkout().unwrap();
-        assert_eq!(ptr, reused.as_mut().as_ptr());
-        assert!(pool.idle.lock().unwrap().is_none());
-        drop(reused);
-        assert!(pool.idle.lock().unwrap().is_some());
     }
 
     fn check_reference(mut memory: Memory, kib: u32) {
@@ -209,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn reused_heap_and_native_memory_match_fresh_reference_hashes() {
+    fn heap_and_native_memory_match_fresh_reference_hashes() {
         for kib in [8, 32, 4096] {
             check_reference(Memory::heap(kib as usize).unwrap(), kib);
             check_reference(Memory::new(kib as usize).unwrap(), kib);
