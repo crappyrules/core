@@ -5,12 +5,14 @@ import (
 	"crypto/rand"
 	"crypto/sha3"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"math/big"
-	"os"
-	"strconv"
+	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,9 +22,6 @@ import (
 )
 
 const (
-	// BLOCKNET_CHAIN_CACHE_CAP caps the number of blocks/work entries kept in RAM.
-	// Nodes can lower this to reduce memory or raise it to trade memory for speed.
-	chainCacheCapEnv      = "BLOCKNET_CHAIN_CACHE_CAP"
 	defaultChainCacheCap  = 512
 	chainCacheCapMinSlack = 64
 	chainCacheCapHardMax  = 100_000
@@ -323,6 +322,32 @@ func validateTimestamp(header *BlockHeader, chain *Chain) error {
 	return validateTimestampWithMedian(header, medianTime)
 }
 
+// blockSpaceForTransactions is the room left in a block for mempool transactions
+// once the header and this coinbase are counted.
+func blockSpaceForTransactions(coinbase *Transaction) int {
+	return MaxBlockSize - blockHeaderSerializedSize - coinbase.Size()
+}
+
+// templateTimestamp returns now, raised if needed so a block built on prevHash
+// satisfies the timestamp rules. A parent may be stamped up to TimestampFuturLimit
+// ahead of this node's clock, and a child at or before it would be rejected.
+func (c *Chain) templateTimestamp(prevHash [32]byte, now int64) int64 {
+	ancestors, err := c.storage.GetAncestorHeaders(prevHash, 11)
+	if err != nil {
+		return now
+	}
+	getParent := func(hash [32]byte) *Block { return ancestors[hash] }
+	parent := getParent(prevHash)
+	if parent == nil {
+		return now
+	}
+	floor := parent.Header.Timestamp
+	if median, err := medianTimestampFromParent(parent, getParent, 11); err == nil && median > floor {
+		floor = median
+	}
+	return max(now, floor+1)
+}
+
 func validateTimestampWithMedian(header *BlockHeader, medianTime int64) error {
 	if header.Timestamp <= medianTime {
 		return fmt.Errorf("timestamp %d <= median %d", header.Timestamp, medianTime)
@@ -451,12 +476,6 @@ func validateBlockWithContext(
 		return fmt.Errorf("timestamp too far in future")
 	}
 
-	if !skipPoW {
-		if !validatePoW(header) {
-			return fmt.Errorf("invalid proof of work")
-		}
-	}
-
 	if block.Size() > MaxBlockSize {
 		return fmt.Errorf("block too large: %d > %d", block.Size(), MaxBlockSize)
 	}
@@ -472,6 +491,22 @@ func validateBlockWithContext(
 	for i := 1; i < len(block.Transactions); i++ {
 		if block.Transactions[i].IsCoinbase() {
 			return fmt.Errorf("multiple coinbase transactions")
+		}
+	}
+
+	// Everything cheap comes before proof of work, so a block that fails one of
+	// these costs the sender as much as it costs us.
+	merkleRoot, err := block.ComputeMerkleRoot()
+	if err != nil {
+		return fmt.Errorf("failed to compute merkle root: %w", err)
+	}
+	if merkleRoot != header.MerkleRoot {
+		return fmt.Errorf("invalid merkle root")
+	}
+
+	if !skipPoW {
+		if !validatePoW(header) {
+			return fmt.Errorf("invalid proof of work")
 		}
 	}
 
@@ -493,14 +528,6 @@ func validateBlockWithContext(
 	}
 	if err := validateCoinbaseConsensus(block.Transactions[0], header.Height); err != nil {
 		return fmt.Errorf("invalid coinbase consensus commitment: %w", err)
-	}
-
-	merkleRoot, err := block.ComputeMerkleRoot()
-	if err != nil {
-		return fmt.Errorf("failed to compute merkle root: %w", err)
-	}
-	if merkleRoot != header.MerkleRoot {
-		return fmt.Errorf("invalid merkle root")
 	}
 
 	return nil
@@ -869,6 +896,8 @@ func (c *Chain) SetTrustedCheckpoints(checkpoints map[uint64][32]byte, maxHeight
 	if len(checkpoints) == 0 || maxHeight == 0 {
 		c.trustedCheckpoints = nil
 		c.fastSyncUntilHeight = 0
+		c.fastSyncUntil.Store(0)
+		c.checkpointsSnap.Store(nil)
 		return
 	}
 	cp := make(map[uint64][32]byte, len(checkpoints))
@@ -877,6 +906,106 @@ func (c *Chain) SetTrustedCheckpoints(checkpoints map[uint64][32]byte, maxHeight
 	}
 	c.trustedCheckpoints = cp
 	c.fastSyncUntilHeight = maxHeight
+	c.fastSyncUntil.Store(maxHeight)
+	c.checkpointsSnap.Store(&cp)
+}
+
+func (c *Chain) predictSkipVerification(block *Block) bool {
+	until := c.fastSyncUntil.Load()
+	if until == 0 {
+		return false
+	}
+	height, bestHash, _ := c.TipFast()
+	h := block.Header.Height
+	return block.Header.PrevHash == bestHash && height < until && h > 0 && h <= until
+}
+
+func (c *Chain) passesCheapPrecheck(block *Block) bool {
+	h := &block.Header
+	if h.Version == 0 || h.Difficulty < MinDifficulty {
+		return false
+	}
+	if tip, _, _ := c.TipFast(); h.Height+MaxReorgDepth < tip {
+		return false
+	}
+	if len(block.Transactions) == 0 || slices.Contains(block.Transactions, nil) || !block.Transactions[0].IsCoinbase() || block.Size() > MaxBlockSize {
+		return false
+	}
+	if cp := c.checkpointsSnap.Load(); cp != nil {
+		if want, ok := (*cp)[h.Height]; ok && want != block.Hash() {
+			return false
+		}
+	}
+	ancestors, err := c.storage.GetAncestorHeaders(h.PrevHash, LWMAWindow+1)
+	if err != nil {
+		return false
+	}
+	getParent := func(hash [32]byte) *Block { return ancestors[hash] }
+	parent := getParent(h.PrevHash)
+	if parent == nil || h.Height != parent.Header.Height+1 || h.Timestamp <= parent.Header.Timestamp {
+		return false
+	}
+	expected, err := expectedDifficultyFromParent(parent, getParent)
+	if err != nil || h.Difficulty != expected {
+		return false
+	}
+	median, err := medianTimestampFromParent(parent, getParent, 11)
+	if err != nil || validateTimestampWithMedian(h, median) != nil {
+		return false
+	}
+	root, err := block.ComputeMerkleRoot()
+	return err == nil && root == h.MerkleRoot
+}
+
+func preverifyBlockCrypto(block *Block) error {
+	if !validatePoW(&block.Header) {
+		return fmt.Errorf("invalid proof of work")
+	}
+
+	var (
+		wg       sync.WaitGroup
+		errOnce  sync.Once
+		firstErr error
+	)
+	sem := make(chan struct{}, runtime.GOMAXPROCS(0))
+	run := func(check func() error) {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer func() { <-sem; wg.Done() }()
+			if err := check(); err != nil {
+				errOnce.Do(func() { firstErr = err })
+			}
+		}()
+	}
+	for i, tx := range block.Transactions {
+		if !tx.IsCoinbase() {
+			sigHash := tx.SigningHash()
+			for j, input := range tx.Inputs {
+				if len(input.RingMembers) != RingSize || len(input.RingCommitments) != RingSize {
+					wg.Wait()
+					return fmt.Errorf("invalid transaction %d: input %d: ring size must be %d", i, j, RingSize)
+				}
+				run(func() error {
+					sig := &RingCTSignature{Signature: input.RingSignature, RingSize: len(input.RingMembers)}
+					if err := VerifyRingCT(input.RingMembers, input.RingCommitments, sigHash[:], sig); err != nil {
+						return fmt.Errorf("invalid transaction %d: input %d: invalid RingCT signature: %w", i, j, err)
+					}
+					return nil
+				})
+			}
+		}
+		for j, output := range tx.Outputs {
+			run(func() error {
+				if err := VerifyRangeProof(output.Commitment, &RangeProof{Proof: output.RangeProof}); err != nil {
+					return fmt.Errorf("invalid transaction %d: output %d: invalid range proof: %w", i, j, err)
+				}
+				return nil
+			})
+		}
+	}
+	wg.Wait()
+	return firstErr
 }
 
 func (c *Chain) shouldSkipPoWLocked(height uint64, extendsTip bool) bool {
@@ -976,6 +1105,8 @@ type Chain struct {
 	// requiring checkpoint-height hashes to match.
 	trustedCheckpoints  map[uint64][32]byte
 	fastSyncUntilHeight uint64
+	fastSyncUntil       atomic.Uint64
+	checkpointsSnap     atomic.Pointer[map[uint64][32]byte]
 }
 
 func chainProtectedBack() uint64 {
@@ -983,12 +1114,10 @@ func chainProtectedBack() uint64 {
 	return max(uint64(MaxReorgDepth), uint64(LWMAWindow+10))
 }
 
-func chainCacheCapFromEnv() int {
+func clampChainCacheCap(requested int) int {
 	cap := defaultChainCacheCap
-	if v := os.Getenv(chainCacheCapEnv); v != "" {
-		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
-			cap = parsed
-		}
+	if requested > 0 {
+		cap = requested
 	}
 	// Clamp to a reasonable hard max to avoid accidental runaway allocations.
 	if cap > chainCacheCapHardMax {
@@ -1065,40 +1194,56 @@ func (c *Chain) cacheTrimLocked() {
 }
 
 func (c *Chain) cumulativeWorkAtLocked(hash [32]byte) (uint64, error) {
-	if work, ok := c.workAt[hash]; ok {
-		return work, nil
+	var hashes [][32]byte
+	var difficulties []uint64
+	var work uint64
+	for cur := hash; ; {
+		if w, ok := c.workAt[cur]; ok {
+			work = w
+			break
+		}
+		if cur == c.bestHash && c.bestHash != ([32]byte{}) {
+			work = c.totalWork
+			break
+		}
+		block := c.getBlockByHashLocked(cur)
+		if block == nil {
+			return 0, fmt.Errorf("block not found for workAt: %x", cur[:8])
+		}
+		hashes = append(hashes, cur)
+		difficulties = append(difficulties, block.Header.Difficulty)
+		if block.Header.Height == 0 {
+			break
+		}
+		cur = block.Header.PrevHash
 	}
-	block := c.getBlockByHashLocked(hash)
-	if block == nil {
-		return 0, fmt.Errorf("block not found for workAt: %x", hash[:8])
-	}
-
-	var parentWork uint64
-	if block.Header.Height > 0 {
-		w, err := c.cumulativeWorkAtLocked(block.Header.PrevHash)
+	for i := len(hashes) - 1; i >= 0; i-- {
+		w, err := addCumulativeWork(work, difficulties[i])
 		if err != nil {
 			return 0, err
 		}
-		parentWork = w
+		work = w
+		c.workAt[hashes[i]] = work
+		c.cacheTouchLocked(hashes[i])
 	}
-	work, err := addCumulativeWork(parentWork, block.Header.Difficulty)
-	if err != nil {
-		return 0, err
+	if len(hashes) > 0 {
+		c.cacheTrimLocked()
 	}
-	c.workAt[hash] = work
-	c.cacheTouchLocked(hash)
-	c.cacheTrimLocked()
 	return work, nil
 }
 
 // NewChain creates a new chain, loading state from storage
 func NewChain(dataDir string) (*Chain, error) {
+	return NewChainWithCacheCap(dataDir, 0)
+}
+
+func NewChainWithCacheCap(dataDir string, cacheCapSetting int) (*Chain, error) {
 	storage, err := NewStorage(dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open storage: %w", err)
 	}
 
-	cacheCap := chainCacheCapFromEnv()
+	cacheCap := clampChainCacheCap(cacheCapSetting)
 	c := &Chain{
 		storage:                 storage,
 		blocks:                  make(map[[32]byte]*Block),
@@ -1116,18 +1261,21 @@ func NewChain(dataDir string) (*Chain, error) {
 	}
 
 	// Load chain state from storage
+	loadStartedAt := time.Now()
 	if err := c.loadFromStorage(); err != nil {
 		if closeErr := storage.Close(); closeErr != nil {
 			return nil, fmt.Errorf("failed to load chain state: %w (additionally failed to close storage: %v)", err, closeErr)
 		}
 		return nil, fmt.Errorf("failed to load chain state: %w", err)
 	}
+	log.Printf("[perf] startup stage=load_chain_state height=%d elapsed=%s", c.height, time.Since(loadStartedAt).Round(time.Millisecond))
 
 	return c, nil
 }
 
 // loadFromStorage loads chain state from disk
 func (c *Chain) loadFromStorage() error {
+	loadStartedAt := time.Now()
 	tipHash, tipHeight, tipWork, found := c.storage.GetTip()
 	if !found {
 		// Fresh chain - no state to load
@@ -1213,6 +1361,8 @@ func (c *Chain) loadFromStorage() error {
 	}
 
 	c.canonicalRingIndexDirty = true
+	recentLoaded := time.Now()
+	log.Printf("[perf] startup stage=load_recent_blocks blocks=%d elapsed=%s", tipHeight-startHeight+1, recentLoaded.Sub(loadStartedAt).Round(time.Millisecond))
 
 	// Build the canonical ring-member index eagerly while we still have
 	// exclusive, single-threaded access (NewChain hasn't returned yet, so no
@@ -1221,9 +1371,33 @@ func (c *Chain) loadFromStorage() error {
 	// (both of which only run under c.mu.Lock). This is what lets the
 	// read-only ring-member checks stay safe under c.mu.RLock: they never need
 	// to rebuild the index from a read-locked context.
+	//
+	// The index is persisted beside the chain (storage_ring_index.go), so a
+	// normal start only loads it; it is rebuilt from blocks only when the
+	// persisted copy does not match the stored tip.
+	if heights, tip, ok, err := c.storage.LoadCanonicalRingIndex(); err != nil {
+		log.Printf("Warning: persisted canonical ring index unreadable, rebuilding: %v", err)
+	} else if ok && tip == c.bestHash {
+		index := make(map[[64]byte]struct{}, len(heights))
+		for key := range heights {
+			index[key] = struct{}{}
+		}
+		c.canonicalRingIndex = index
+		c.canonicalRingHeights = heights
+		c.canonicalRingIndexTip = tip
+		c.canonicalRingIndexReady = true
+		c.canonicalRingIndexDirty = false
+		log.Printf("[perf] startup stage=canonical_ring_index source=persisted members=%d elapsed=%s", len(index), time.Since(recentLoaded).Round(time.Millisecond))
+		return nil
+	}
 	if err := c.ensureCanonicalRingIndexLocked(); err != nil {
 		return fmt.Errorf("failed to build canonical ring-member index: %w", err)
 	}
+	built := time.Now()
+	if err := c.storage.SaveCanonicalRingIndex(c.canonicalRingHeights, c.canonicalRingIndexTip); err != nil {
+		log.Printf("Warning: failed to persist canonical ring index (next start rebuilds it): %v", err)
+	}
+	log.Printf("[perf] startup stage=canonical_ring_index source=rebuilt members=%d rebuild=%s persist=%s", len(c.canonicalRingIndex), built.Sub(recentLoaded).Round(time.Millisecond), time.Since(built).Round(time.Millisecond))
 
 	return nil
 }
@@ -1243,13 +1417,54 @@ func (c *Chain) Storage() *Storage {
 
 // Height returns current chain height
 type tipSnapshot struct {
-	height    uint64
-	bestHash  [32]byte
-	totalWork uint64
+	height         uint64
+	bestHash       [32]byte
+	totalWork      uint64
+	nextDifficulty uint64
+	tipDifficulty  uint64
 }
 
 func (c *Chain) publishTipLocked() {
-	c.tipSnap.Store(&tipSnapshot{height: c.height, bestHash: c.bestHash, totalWork: c.totalWork})
+	// nextDifficulty is folded in here because it only changes when the tip
+	// does, and computing it needs the in-memory block cache this lock guards.
+	// Readers that just display it can then have it for free.
+	c.tipSnap.Store(&tipSnapshot{
+		height:         c.height,
+		bestHash:       c.bestHash,
+		totalWork:      c.totalWork,
+		nextDifficulty: c.nextDifficultyLocked(),
+		tipDifficulty:  c.lookupTipDifficultyLocked(),
+	})
+}
+
+// lookupTipDifficultyLocked reads the tip block without touching the cache, so a
+// read lock is enough.
+func (c *Chain) lookupTipDifficultyLocked() uint64 {
+	tip := c.blocks[c.bestHash]
+	if tip == nil {
+		tip, _ = c.storage.GetBlock(c.bestHash)
+	}
+	if tip == nil {
+		return 0
+	}
+	return tip.Header.Difficulty
+}
+
+// tipDifficultyLocked returns the difficulty of the current tip block.
+func (c *Chain) tipDifficultyLocked() uint64 {
+	if s := c.tipSnap.Load(); s != nil && s.bestHash == c.bestHash {
+		return s.tipDifficulty
+	}
+	return c.lookupTipDifficultyLocked()
+}
+
+// TipDifficultyFast returns the difficulty of the current tip block without
+// taking a lock, or 0 before the chain has a tip.
+func (c *Chain) TipDifficultyFast() uint64 {
+	if s := c.tipSnap.Load(); s != nil {
+		return s.tipDifficulty
+	}
+	return 0
 }
 
 // TipFast returns the chain tip without taking any lock.
@@ -1261,9 +1476,50 @@ func (c *Chain) TipFast() (uint64, [32]byte, uint64) {
 }
 
 func (c *Chain) Height() uint64 {
+	if s := c.tipSnap.Load(); s != nil {
+		return s.height
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.height
+}
+
+// HeightFast returns the tip height from the atomic tip snapshot, taking no
+// lock. Read paths that only need the height should use it: c.mu is held by
+// block processing, and Go's RWMutex is writer-preferring, so one waiting
+// writer parks every later reader behind it. A page that only prints the
+// height has no business queueing behind a block commit.
+func (c *Chain) HeightFast() uint64 {
+	if s := c.tipSnap.Load(); s != nil {
+		return s.height
+	}
+	// No snapshot published yet. Answering 0 here would read as an empty chain,
+	// so pay for the lock rather than report a height that is not true.
+	return c.Height()
+}
+
+// GetBlockFast reads a block straight from storage and takes no chain lock.
+// ProcessBlock holds c.mu for the whole of block validation, so a reader that
+// goes through the cache can wait on a ring-signature check before it can
+// display a block it already has on disk. Read-only viewers pay one bolt read
+// instead, and never stall the writer.
+func (c *Chain) GetBlockFast(hash [32]byte) *Block {
+	block, err := c.storage.GetBlock(hash)
+	if err != nil {
+		return nil
+	}
+	return block
+}
+
+// GetBlockByHeightFast is GetBlockByHeight without the chain lock. Same reason
+// as GetBlockFast: main-chain height to hash and the block itself both live in
+// storage, so a viewer needs nothing the writer holds.
+func (c *Chain) GetBlockByHeightFast(height uint64) *Block {
+	hash, found := c.storage.GetBlockHashByHeight(height)
+	if !found {
+		return nil
+	}
+	return c.GetBlockFast(hash)
 }
 
 // HasGenesis returns true if the chain has at least the genesis block
@@ -1278,6 +1534,9 @@ func (c *Chain) HasGenesis() bool {
 
 // BestHash returns the hash of the best block
 func (c *Chain) BestHash() [32]byte {
+	if s := c.tipSnap.Load(); s != nil {
+		return s.bestHash
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.bestHash
@@ -1316,11 +1575,32 @@ func (c *Chain) GetBlock(hash [32]byte) *Block {
 	return block
 }
 
-// GetBlockByHeight retrieves a block by height
+// GetBlockByHeight retrieves a block by height.
+//
+// The cache probe holds c.mu.RLock; the storage fallback deliberately does not,
+// so a cache miss cannot stall every later reader behind a waiting writer. A
+// reorg landing between the two can therefore return the block that was
+// main-chain at that height a moment earlier. bbolt gives per-transaction
+// snapshot isolation and blocks are never deleted, so the read is always
+// well-formed. Callers that need a consistent span use GetBlocksByHeightRange.
 func (c *Chain) GetBlockByHeight(height uint64) *Block {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.getBlockByHeightLocked(height)
+	if !c.mu.TryRLock() {
+		return c.GetBlockByHeightFast(height)
+	}
+	if hash, ok := c.byHeight[height]; ok {
+		if block, ok := c.blocks[hash]; ok {
+			c.mu.RUnlock()
+			return block
+		}
+	}
+	c.mu.RUnlock()
+
+	hash, found := c.storage.GetBlockHashByHeight(height)
+	if !found {
+		return nil
+	}
+	block, _ := c.storage.GetBlock(hash)
+	return block
 }
 
 // GetBlocksByHeightRange returns main-chain blocks in [startHeight, endHeight],
@@ -1346,6 +1626,14 @@ func (c *Chain) GetBlocksByHeightRange(startHeight, endHeight uint64) []*Block {
 		blocks = append(blocks, b)
 	}
 	return blocks
+}
+
+func (c *Chain) isMainChainHashLocked(height uint64, hash [32]byte) bool {
+	if mainHash, ok := c.byHeight[height]; ok {
+		return mainHash == hash
+	}
+	mainHash, ok := c.storage.GetBlockHashByHeight(height)
+	return ok && mainHash == hash
 }
 
 // getBlockByHeightLocked is the lock-safe inner implementation.
@@ -1386,6 +1674,55 @@ func (c *Chain) NextDifficulty() uint64 {
 	return c.nextDifficultyLocked()
 }
 
+// NextDifficultyFast returns the difficulty from the tip snapshot, taking no
+// lock. It is the same value NextDifficulty computes for the current tip, so
+// display paths never wait on block processing to render a number.
+func (c *Chain) NextDifficultyFast() uint64 {
+	if s := c.tipSnap.Load(); s != nil && s.nextDifficulty != 0 {
+		return s.nextDifficulty
+	}
+	return c.NextDifficulty()
+}
+
+// RecentBlockStats estimates network hashrate (hashes per second) and average
+// block time (seconds) over up to the most recent `samples` block intervals.
+// Returns zeros when there is insufficient history. It reads the tip snapshot
+// and storage directly, so it takes no chain lock and never waits on a commit.
+func (c *Chain) RecentBlockStats(samples int) (hashrate float64, avgBlockTime float64) {
+	if samples <= 0 {
+		return 0, 0
+	}
+	height := c.HeightFast()
+	if height < 2 {
+		return 0, 0
+	}
+	var totalTime int64
+	var totalWork uint64
+	var count int
+	for h := height; h > 0 && count < samples; h-- {
+		block := c.GetBlockByHeightFast(h)
+		prev := c.GetBlockByHeightFast(h - 1)
+		if block == nil || prev == nil {
+			continue
+		}
+		dt := block.Header.Timestamp - prev.Header.Timestamp
+		if dt > 0 {
+			totalTime += dt
+			totalWork += block.Header.Difficulty
+			count++
+		}
+	}
+	if count == 0 || totalTime == 0 {
+		return 0, 0
+	}
+	avgBlockTime = float64(totalTime) / float64(count)
+	// Each sampled interval ended with `block`, so its observed work is that
+	// block's difficulty. Using the next-block difficulty here biases the
+	// estimate whenever difficulty changes during the sample window.
+	hashrate = float64(totalWork) / float64(totalTime)
+	return hashrate, avgBlockTime
+}
+
 // addGenesisBlock adds the genesis block to an empty chain.
 // For all non-genesis blocks, use ProcessBlock.
 func (c *Chain) addGenesisBlock(block *Block) error {
@@ -1401,7 +1738,7 @@ func (c *Chain) addGenesisBlock(block *Block) error {
 	if _, _, _, found := c.storage.GetTip(); found {
 		return fmt.Errorf("genesis already exists; refusing unvalidated write path")
 	}
-	if err := c.validateBlockForProcessLocked(block); err != nil {
+	if err := c.validateBlockForProcessLocked(block, false); err != nil {
 		return fmt.Errorf("invalid genesis block: %w", err)
 	}
 
@@ -1497,10 +1834,69 @@ func (c *Chain) addBlockInternal(block *Block) error {
 // ProcessBlock validates and adds a block, handling fork choice
 // Returns true if block was accepted (even if not on main chain)
 func (c *Chain) ProcessBlock(block *Block) (accepted bool, isMainChain bool, err error) {
+	preverification, err := c.PreverifyBlock(block)
+	if err != nil {
+		return false, false, err
+	}
+	return c.ProcessPreverifiedBlock(block, preverification)
+}
+
+// BlockPreverification is the outcome of checking a block's proof of work and
+// signatures before any chain lock is taken.
+type BlockPreverification struct {
+	Verified bool
+}
+
+// maxConcurrentBlockVerifications bounds PoW memory: each verification uses 2 GiB.
+const maxConcurrentBlockVerifications = 2
+
+var (
+	blockVerifySlots = make(chan struct{}, maxConcurrentBlockVerifications)
+	// runBlockPreverify is replaced in tests to avoid real PoW.
+	runBlockPreverify = preverifyBlockCrypto
+)
+
+// NeedsPreverification reports whether a block can pass every cheap check and so
+// is worth the cost of verifying its proof of work.
+func (c *Chain) NeedsPreverification(block *Block) bool {
+	return block.Header.Height > 0 && !c.storage.HasBlock(block.Hash()) && !c.predictSkipVerification(block) && c.passesCheapPrecheck(block)
+}
+
+// PreverifyBlock checks a block's proof of work and signatures. It takes no chain
+// lock, so callers must not hold one either: this takes about a second.
+func (c *Chain) PreverifyBlock(block *Block) (BlockPreverification, error) {
+	if !c.NeedsPreverification(block) {
+		return BlockPreverification{}, nil
+	}
+	blockVerifySlots <- struct{}{}
+	defer func() { <-blockVerifySlots }()
+	return finishPreverify(block)
+}
+
+// PreverifyOwnBlock is PreverifyBlock for a block this node's miners found. It
+// doesn't wait for a verification slot: nothing a peer sends may delay our block.
+func (c *Chain) PreverifyOwnBlock(block *Block) (BlockPreverification, error) {
+	if !c.NeedsPreverification(block) {
+		return BlockPreverification{}, nil
+	}
+	return finishPreverify(block)
+}
+
+func finishPreverify(block *Block) (BlockPreverification, error) {
+	if err := runBlockPreverify(block); err != nil {
+		return BlockPreverification{}, err
+	}
+	return BlockPreverification{Verified: true}, nil
+}
+
+// ProcessPreverifiedBlock adds a block to the chain, using the outcome of an
+// earlier PreverifyBlock.
+func (c *Chain) ProcessPreverifiedBlock(block *Block, preverification BlockPreverification) (accepted bool, isMainChain bool, err error) {
+	hash := block.Hash()
+	preverified := preverification.Verified
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	hash := block.Hash()
 
 	// Already have this block? Check memory and storage
 	if _, exists := c.blocks[hash]; exists {
@@ -1510,7 +1906,7 @@ func (c *Chain) ProcessBlock(block *Block) (accepted bool, isMainChain bool, err
 		return false, false, nil
 	}
 
-	if err := c.validateBlockForProcessLocked(block); err != nil {
+	if err := c.validateBlockForProcessLocked(block, preverified); err != nil {
 		return false, false, err
 	}
 
@@ -1534,8 +1930,8 @@ func (c *Chain) ProcessBlock(block *Block) (accepted bool, isMainChain bool, err
 	c.workAt[hash] = blockWork
 	c.cacheTrimLocked()
 
-	// Does this create a heavier chain?
-	if blockWork > c.totalWork {
+	// Does this create a branch we should follow?
+	if params.PrefersBranch(c.totalWork, c.height, c.tipDifficultyLocked(), blockWork, block.Header.Height) {
 		if err := c.reorganizeTo(hash); err != nil {
 			// Reorg failed - remove from memory
 			c.cacheForgetLocked(hash)
@@ -1552,9 +1948,13 @@ func (c *Chain) ProcessBlock(block *Block) (accepted bool, isMainChain bool, err
 	return true, false, nil
 }
 
-func (c *Chain) validateBlockForProcessLocked(block *Block) error {
+func (c *Chain) validateBlockForProcessLocked(block *Block, preverified bool) error {
 	isSpent := c.isKeyImageSpentLocked
 	isCanonicalRingMember := c.isCanonicalRingMemberLocked
+	// Past the reorg limit a side chain can never win, so it would only fill the disk.
+	if block != nil && block.Header.Height+MaxReorgDepth < c.height {
+		return fmt.Errorf("block height %d is below the reorg limit at tip %d", block.Header.Height, c.height)
+	}
 	if block != nil && block.Header.Height > 0 {
 		branchAwareSpent, err := c.branchAwareSpentCheckerLocked(block.Header.PrevHash)
 		if err != nil {
@@ -1583,8 +1983,8 @@ func (c *Chain) validateBlockForProcessLocked(block *Block) error {
 	}
 
 	extendsTip := block != nil && block.Header.PrevHash == c.bestHash
-	skipPoW := false
-	if block != nil {
+	skipPoW := preverified
+	if block != nil && !skipPoW {
 		skipPoW = c.shouldSkipPoWLocked(block.Header.Height, extendsTip)
 	}
 
@@ -1618,8 +2018,7 @@ func (c *Chain) branchAwareSpentCheckerLocked(parentHash [32]byte) (KeyImageChec
 			return nil, ErrOrphanBlock
 		}
 
-		mainHashAtHeight, onMainHeight := c.byHeight[parent.Header.Height]
-		if onMainHeight && mainHashAtHeight == currentHash {
+		if c.isMainChainHashLocked(parent.Header.Height, currentHash) {
 			commonHeight = parent.Header.Height
 			break
 		}
@@ -1670,8 +2069,7 @@ func (c *Chain) branchAwareRingMemberCheckerLocked(parentHash [32]byte) (RingMem
 			return nil, ErrOrphanBlock
 		}
 
-		mainHashAtHeight, onMainHeight := c.byHeight[parent.Header.Height]
-		if onMainHeight && mainHashAtHeight == currentHash {
+		if c.isMainChainHashLocked(parent.Header.Height, currentHash) {
 			commonHeight = parent.Header.Height
 			break
 		}
@@ -1877,6 +2275,10 @@ func (c *Chain) updateCanonicalRingIndexForDisconnect(blocks []*Block) {
 		for _, tx := range block.Transactions {
 			for _, out := range tx.Outputs {
 				key := canonicalRingIndexKey(out.PublicKey, out.Commitment)
+				// A repeated output stays canonical through its earlier copy.
+				if height, ok := c.canonicalRingHeights[key]; ok && height != block.Header.Height {
+					continue
+				}
 				delete(c.canonicalRingIndex, key)
 				delete(c.canonicalRingHeights, key)
 			}
@@ -1968,8 +2370,19 @@ func (c *Chain) nextDifficultyLocked() uint64 {
 	blocks := make([]*Block, LWMAWindow+1)
 	for i := 0; i <= LWMAWindow; i++ {
 		height := c.height - uint64(LWMAWindow) + uint64(i)
-		hash := c.byHeight[height]
+		hash, ok := c.byHeight[height]
+		if !ok {
+			if hash, ok = c.storage.GetBlockHashByHeight(height); !ok {
+				return c.nextDifficultyByHashLocked()
+			}
+		}
 		blocks[i] = c.blocks[hash]
+		if blocks[i] == nil {
+			blocks[i], _ = c.storage.GetBlock(hash)
+			if blocks[i] == nil {
+				return c.nextDifficultyByHashLocked()
+			}
+		}
 	}
 
 	// Calculate weighted sum of solve times and sum of difficulties
@@ -2001,6 +2414,15 @@ func (c *Chain) nextDifficultyLocked() uint64 {
 		newDiff = MinDifficulty
 	}
 	return newDiff
+}
+
+func (c *Chain) nextDifficultyByHashLocked() uint64 {
+	difficulty, err := expectedDifficultyFromParent(c.getBlockByHashLocked(c.bestHash), c.getBlockByHashLocked)
+	if err != nil {
+		log.Printf("next difficulty: %v", err)
+		return MinDifficulty
+	}
+	return difficulty
 }
 
 // reorganizeTo switches the main chain to end at newTip
@@ -2308,40 +2730,23 @@ func (c *Chain) TruncateToHeight(keepHeight uint64) error {
 		return nil // nothing to do
 	}
 
-	// Disconnect blocks from top down
+	commit := &TruncateCommit{}
+	var evict [][32]byte
+
+	// Collect first, write once: the old per-height loop hit storage before it
+	// knew the new tip was reachable, so a failure left a half-truncated chain.
 	for h := c.height; h > keepHeight; h-- {
+		commit.Heights = append(commit.Heights, h)
+
 		block := c.getBlockByHeightLocked(h)
 		if block == nil {
-			// Already missing, just clean up the index
-			if err := c.storage.RemoveMainChainBlock(h); err != nil {
-				return fmt.Errorf("failed to remove main-chain index at height %d: %w", h, err)
-			}
 			delete(c.byHeight, h)
 			continue
 		}
-
-		// Remove key images from this block
-		for _, tx := range block.Transactions {
-			if !tx.IsCoinbase() {
-				for _, input := range tx.Inputs {
-					delete(c.keyImages, input.KeyImage)
-					if err := c.storage.UnmarkKeyImageSpent(input.KeyImage); err != nil {
-						return fmt.Errorf("failed to unmark key image at height %d: %w", h, err)
-					}
-				}
-			}
-		}
-
-		// Remove from height index
-		if err := c.storage.RemoveMainChainBlock(h); err != nil {
-			return fmt.Errorf("failed to remove main-chain block at height %d: %w", h, err)
-		}
-		delete(c.byHeight, h)
-		hash := block.Hash()
-		c.cacheForgetLocked(hash)
+		commit.Disconnect = append(commit.Disconnect, block)
+		evict = append(evict, block.Hash())
 	}
 
-	// Set new tip
 	newTip := c.getBlockByHeightLocked(keepHeight)
 	if newTip == nil {
 		return fmt.Errorf("block at height %d not found after truncation", keepHeight)
@@ -2350,6 +2755,29 @@ func (c *Chain) TruncateToHeight(keepHeight uint64) error {
 	newWork, err := c.cumulativeWorkAtLocked(newHash)
 	if err != nil {
 		return fmt.Errorf("failed to compute cumulative work for new tip: %w", err)
+	}
+
+	commit.NewTip = newHash
+	commit.NewHeight = keepHeight
+	commit.NewWork = newWork
+
+	if err := c.storage.CommitTruncate(commit); err != nil {
+		return fmt.Errorf("failed to truncate chain to height %d: %w", keepHeight, err)
+	}
+
+	for _, block := range commit.Disconnect {
+		for _, tx := range block.Transactions {
+			if tx.IsCoinbase() {
+				continue
+			}
+			for _, input := range tx.Inputs {
+				delete(c.keyImages, input.KeyImage)
+			}
+		}
+		delete(c.byHeight, block.Header.Height)
+	}
+	for _, hash := range evict {
+		c.cacheForgetLocked(hash)
 	}
 
 	c.bestHash = newHash
@@ -2373,11 +2801,6 @@ func (c *Chain) TruncateToHeight(keepHeight uint64) error {
 		}
 	}
 
-	// Persist new tip
-	if err := c.storage.SetTip(newHash, keepHeight, newWork); err != nil {
-		return fmt.Errorf("failed to persist new tip: %w", err)
-	}
-
 	// Rebuild the canonical ring-member index while we still hold the write
 	// lock so concurrent read-lock callers (IsCanonicalRingMember,
 	// SelectRingMembersWithCommitments) never observe a dirty index and never
@@ -2391,6 +2814,9 @@ func (c *Chain) TruncateToHeight(keepHeight uint64) error {
 
 // TotalWork returns the cumulative work of the main chain
 func (c *Chain) TotalWork() uint64 {
+	if s := c.tipSnap.Load(); s != nil {
+		return s.totalWork
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.totalWork
@@ -2407,6 +2833,13 @@ type BlockTemplateParams struct {
 // TemplateParams returns the next-block height, previous hash, and difficulty
 // as a consistent snapshot.
 func (c *Chain) TemplateParams() BlockTemplateParams {
+	if s := c.tipSnap.Load(); s != nil && s.nextDifficulty != 0 {
+		return BlockTemplateParams{
+			Height:     s.height + 1,
+			PrevHash:   s.bestHash,
+			Difficulty: s.nextDifficulty,
+		}
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return BlockTemplateParams{
@@ -2586,52 +3019,29 @@ func finalizeRingSelection(decoyPool []ringMemberCandidate, realPubKey, realComm
 
 // IsFinalized returns true if a block at given height is beyond reorg depth
 func (c *Chain) IsFinalized(height uint64) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	if c.height < height {
+	tip := c.Height()
+	if tip < height {
 		return false
 	}
-	return c.height-height >= MaxReorgDepth
+	return tip-height >= MaxReorgDepth
 }
 
 // FindTxByHashStr searches for a transaction by hex hash string, scanning
 // blocks from tip backwards. Returns the transaction, block height, and
 // whether it was found.
 func (c *Chain) FindTxByHashStr(hashStr string) (*Transaction, uint64, bool) {
-	c.mu.RLock()
-	tipHeight := c.height
-	c.mu.RUnlock()
-
-	for h := tipHeight; ; h-- {
-		hash, found := c.storage.GetBlockHashByHeight(h)
-		if !found {
-			if h == 0 {
-				break
-			}
-			continue
-		}
-
-		block, err := c.storage.GetBlock(hash)
-		if err != nil || block == nil {
-			if h == 0 {
-				break
-			}
-			continue
-		}
-
-		for _, tx := range block.Transactions {
-			txID, _ := tx.TxID()
-			if fmt.Sprintf("%x", txID) == hashStr {
-				return tx, h, true
-			}
-		}
-
-		if h == 0 {
-			break
-		}
+	decoded, err := hex.DecodeString(hashStr)
+	if err != nil || len(decoded) != 32 {
+		return nil, 0, false
 	}
-	return nil, 0, false
+	var id [32]byte
+	copy(id[:], decoded)
+	txn, height, err := c.storage.FindCanonicalTransaction(id)
+	if err != nil {
+		log.Printf("transaction lookup failed: %v", err)
+		return nil, 0, false
+	}
+	return txn, height, txn != nil
 }
 
 // ============================================================================

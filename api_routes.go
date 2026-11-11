@@ -13,7 +13,9 @@ func (s *APIServer) registerPublicRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/mempool/txs", s.handleMempoolTxs)
 	mux.HandleFunc("GET /api/peers", s.handlePeers)
 	mux.HandleFunc("GET /api/peers/banned", s.handleBannedPeers)
+	mux.HandleFunc("GET /api/stats", s.handleStats)
 	mux.HandleFunc("POST /api/verify", s.handleVerify)
+	mux.HandleFunc("POST /api/verify-proof", s.handleVerifyProof)
 }
 
 // registerPrivateRoutes adds wallet, mining, and control endpoints.
@@ -27,6 +29,7 @@ func (s *APIServer) registerPrivateRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/wallet/balance", s.handleBalance)
 	mux.HandleFunc("GET /api/wallet/address", s.handleAddress)
 	mux.HandleFunc("GET /api/wallet/history", s.handleHistory)
+	mux.HandleFunc("GET /api/wallet/history/page", s.handleHistoryPage)
 	mux.HandleFunc("GET /api/wallet/sends", s.handleSends)
 	mux.HandleFunc("GET /api/wallet/outputs", s.handleOutputs)
 	mux.HandleFunc("POST /api/wallet/send", s.handleSend)
@@ -40,10 +43,18 @@ func (s *APIServer) registerPrivateRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/wallet/sync", s.handleWalletSync)
 	mux.HandleFunc("POST /api/wallet/prove", s.handleProve)
 	mux.HandleFunc("POST /api/wallet/audit", s.handleAudit)
+	mux.HandleFunc("POST /api/wallet/outputs/audit", s.handleWalletOutputsAudit)
 	mux.HandleFunc("POST /api/wallet/viewkeys", s.handleViewKeys)
 
 	// Chain verification
 	mux.HandleFunc("GET /api/certify", s.handleCertify)
+
+	mux.HandleFunc("GET /api/settings", s.handleGetSettings)
+	mux.HandleFunc("PATCH /api/settings", s.handlePatchSettings)
+
+	// Checkpoints
+	mux.HandleFunc("POST /api/checkpoints/save", s.handleSaveCheckpoints)
+	mux.HandleFunc("POST /api/checkpoints/load", s.handleLoadCheckpoints)
 
 	// Mining
 	mux.HandleFunc("GET /api/mining", s.handleMiningStatus)
@@ -51,6 +62,7 @@ func (s *APIServer) registerPrivateRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/mining/stop", s.handleMiningStop)
 	mux.HandleFunc("POST /api/mining/threads", s.handleMiningThreads)
 	mux.HandleFunc("GET /api/mining/blocktemplate", s.handleBlockTemplate)
+	mux.HandleFunc("POST /api/mining/renewtemplate", s.handleRenewBlockTemplate)
 	mux.HandleFunc("POST /api/mining/submitblock", s.handleSubmitBlock)
 
 	// Dangerous operations

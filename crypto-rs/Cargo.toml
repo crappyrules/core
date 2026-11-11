@@ -1,11 +1,13 @@
 [package]
 name = "crypto-rs"
-version = "0.14.3"
+version = "0.23.0"
 edition = "2021"
 
 [lib]
 name = "blocknet_crypto"
-crate-type = ["cdylib", "staticlib"]
+# rlib added so Rust crates (the PQC signature benchmark) can link the real RingCT
+# code directly; cdylib/staticlib remain for the Go node's cgo FFI. Additive only.
+crate-type = ["rlib", "cdylib", "staticlib"]
 
 [dependencies]
 curve25519-dalek = "4.1"
@@ -14,9 +16,19 @@ rand = "0.8"
 sha2 = "0.10"
 bulletproofs = "5.0"
 merlin = "3.0"
-argon2 = "0.5"
+blocknet-pow-kernel = { git = "https://github.com/zpalmtree/blocknet-pow-kernel", rev = "9f5d0b79d0cc4c169cd112443c524bb4bb946627", version = "=0.1.0" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Memory", "Win32_System_Threading", "Win32_Security"] }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus"] }
 
 [dev-dependencies]
+argon2 = "0.5"
 hex = "0.4"
 
 [profile.release]

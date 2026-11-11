@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"container/heap"
 	"encoding/json"
 	"fmt"
+	"log"
+	"sort"
 	"sync"
 	"time"
 )
@@ -36,13 +39,13 @@ func DefaultMempoolConfig() MempoolConfig {
 // MempoolEntry represents a transaction in the mempool
 type MempoolEntry struct {
 	Tx      *Transaction
-	TxID    [32]byte   // Transaction ID hash
-	TxData  []byte     // Serialized transaction
-	Fee     uint64     // Transaction fee
-	FeeRate uint64     // Fee per byte
-	Size    int        // Size in bytes
-	AddedAt time.Time  // When added to mempool
-	Height  uint64     // Block height when added
+	TxID    [32]byte  // Transaction ID hash
+	TxData  []byte    // Serialized transaction
+	Fee     uint64    // Transaction fee
+	FeeRate uint64    // Fee per byte
+	Size    int       // Size in bytes
+	AddedAt time.Time // When added to mempool
+	Height  uint64    // Block height when added
 
 	// For priority queue
 	index int
@@ -67,7 +70,8 @@ type Mempool struct {
 	isCanonicalRingMember RingMemberChecker
 
 	// Stats
-	totalSize int // Total bytes in mempool
+	totalSize  int    // Total bytes in mempool
+	generation uint64 // Monotonic content version for mining-template refreshes
 }
 
 // NewMempool creates a new mempool
@@ -112,6 +116,14 @@ func (m *Mempool) AddTransaction(tx *Transaction, txData []byte) error {
 		return nil
 	}
 
+	// A block can commit while validation runs without the lock, and
+	// OnBlockConnected won't see a transaction that isn't in the pool yet.
+	for _, input := range parsedTx.Inputs {
+		if m.isKeyImageSpent(input.KeyImage) {
+			return fmt.Errorf("validation failed: key image already spent on chain")
+		}
+	}
+
 	for _, input := range parsedTx.Inputs {
 		if existingTxID, exists := m.txByImage[input.KeyImage]; exists {
 			return fmt.Errorf("double-spend: key image already in mempool (tx %x...)", existingTxID[:8])
@@ -151,34 +163,26 @@ func (m *Mempool) AddTransaction(tx *Transaction, txData []byte) error {
 	}
 	heap.Push(&m.priorityQueue, entry)
 	m.totalSize += size
+	m.generation++
 
 	return nil
 }
 
-// evictLowest removes the lowest fee rate transaction if it's lower than minFeeRate
-func (m *Mempool) evictLowest(minFeeRate uint64) bool {
-	if len(m.priorityQueue) == 0 {
-		return false
-	}
-
-	// Peek at lowest
-	// Note: our heap is max-heap by fee rate, so we need min-heap for eviction
-	// For simplicity, we'll just remove oldest if at capacity
-	var oldest *MempoolEntry
-	var oldestID [32]byte
-	for id, entry := range m.txByID {
-		if oldest == nil || entry.AddedAt.Before(oldest.AddedAt) {
-			oldest = entry
-			oldestID = id
+// evictLowest removes the transaction paying the lowest fee rate (the oldest
+// of equals) if it pays less per byte than feeRate, the newcomer's rate.
+func (m *Mempool) evictLowest(feeRate uint64) bool {
+	var lowest *MempoolEntry
+	for _, entry := range m.txByID {
+		if lowest == nil || entry.FeeRate < lowest.FeeRate ||
+			(entry.FeeRate == lowest.FeeRate && entry.AddedAt.Before(lowest.AddedAt)) {
+			lowest = entry
 		}
 	}
-
-	if oldest != nil && oldest.FeeRate < minFeeRate {
-		m.removeTxByID(oldestID)
-		return true
+	if lowest == nil || lowest.FeeRate >= feeRate {
+		return false
 	}
-
-	return false
+	m.removeTxByID(lowest.TxID)
+	return true
 }
 
 // removeTxByID removes a transaction from mempool by ID
@@ -193,6 +197,7 @@ func (m *Mempool) removeTxByID(txID [32]byte) {
 		delete(m.txByImage, input.KeyImage)
 	}
 	m.totalSize -= entry.Size
+	m.generation++
 
 	// Remove from priority queue
 	if entry.index >= 0 && entry.index < len(m.priorityQueue) {
@@ -257,23 +262,31 @@ func (m *Mempool) HasKeyImage(keyImage [32]byte) bool {
 
 // GetTransactionsForBlock returns transactions for mining sorted by fee rate.
 func (m *Mempool) GetTransactionsForBlock(maxSize int, maxCount int) []*Transaction {
+	txs, _ := m.GetTransactionsForBlockSnapshot(maxSize, maxCount)
+	return txs
+}
+
+// GetTransactionsForBlockSnapshot returns a mining transaction selection and
+// the exact mempool generation from the same read lock. Callers can attach the
+// generation to a block template without racing a concurrent mempool change.
+func (m *Mempool) GetTransactionsForBlockSnapshot(maxSize int, maxCount int) ([]*Transaction, uint64) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	// Collect entries sorted by fee rate (priority queue gives us this)
 	entries := make([]*MempoolEntry, 0, len(m.txByID))
 	for _, entry := range m.txByID {
 		entries = append(entries, entry)
 	}
 
-	// Sort by fee rate descending
-	for i := 0; i < len(entries)-1; i++ {
-		for j := i + 1; j < len(entries); j++ {
-			if entries[j].FeeRate > entries[i].FeeRate {
-				entries[i], entries[j] = entries[j], entries[i]
-			}
+	// Fee rate descending, then TxID. Selection is miner policy, not a
+	// validation rule, but the tie-break makes a template reproducible instead
+	// of depending on map iteration order.
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].FeeRate != entries[j].FeeRate {
+			return entries[i].FeeRate > entries[j].FeeRate
 		}
-	}
+		return bytes.Compare(entries[i].TxID[:], entries[j].TxID[:]) < 0
+	})
 
 	// Select transactions
 	result := make([]*Transaction, 0, maxCount)
@@ -292,7 +305,56 @@ func (m *Mempool) GetTransactionsForBlock(maxSize int, maxCount int) []*Transact
 
 	}
 
-	return result
+	return result, m.generation
+}
+
+// spendableOnChain reports whether the chain's current state would still accept
+// this transaction's key images and ring members. Those are the admission checks
+// a tip change or reorg can invalidate.
+func (m *Mempool) spendableOnChain(tx *Transaction) bool {
+	for _, input := range tx.Inputs {
+		if m.isKeyImageSpent(input.KeyImage) {
+			return false
+		}
+		for j := range input.RingMembers {
+			if j >= len(input.RingCommitments) || !m.isCanonicalRingMember(input.RingMembers[j], input.RingCommitments[j]) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// KeepSpendableOnChain returns the transactions the chain would still accept and
+// removes the rest from the mempool, so one bad entry can't make every block
+// built from a template invalid.
+func (m *Mempool) KeepSpendableOnChain(txs []*Transaction) []*Transaction {
+	kept := txs[:0:0]
+	for _, tx := range txs {
+		if m.spendableOnChain(tx) {
+			kept = append(kept, tx)
+			continue
+		}
+		txID, err := tx.TxID()
+		if err != nil {
+			continue
+		}
+		log.Printf("[mempool] removing %x: no longer valid on the current chain", txID[:8])
+		m.RemoveTransaction(txID)
+	}
+	return kept
+}
+
+// RemoveUnspendableOnChain rechecks every entry against the current chain. It
+// runs after a reorg, which can remove the outputs a ring refers to.
+func (m *Mempool) RemoveUnspendableOnChain() {
+	m.mu.RLock()
+	txs := make([]*Transaction, 0, len(m.txByID))
+	for _, entry := range m.txByID {
+		txs = append(txs, entry.Tx)
+	}
+	m.mu.RUnlock()
+	m.KeepSpendableOnChain(txs)
 }
 
 // Size returns the number of transactions in mempool
@@ -313,11 +375,15 @@ func (m *Mempool) SizeBytes() int {
 func (m *Mempool) Clear() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if len(m.txByID) == 0 {
+		return
+	}
 
 	m.txByID = make(map[[32]byte]*MempoolEntry)
 	m.txByImage = make(map[[32]byte][32]byte)
 	m.priorityQueue = make(txPriorityQueue, 0)
 	m.totalSize = 0
+	m.generation++
 }
 
 // RemoveExpired removes transactions that have been in mempool too long
@@ -434,6 +500,7 @@ func (m *Mempool) OnBlockDisconnected(block *Block, txDataMap map[[32]byte][]byt
 			}
 			heap.Push(&m.priorityQueue, entry)
 			m.totalSize += size
+			m.generation++
 		}
 	}
 }
@@ -452,11 +519,12 @@ func (m *Mempool) GetAllTransactionData() [][]byte {
 
 // Stats returns mempool statistics
 type MempoolStats struct {
-	Count     int     `json:"count"`
-	SizeBytes int     `json:"size_bytes"`
-	MinFee    uint64  `json:"min_fee"`
-	MaxFee    uint64  `json:"max_fee"`
-	AvgFee    float64 `json:"avg_fee"`
+	Count      int     `json:"count"`
+	SizeBytes  int     `json:"size_bytes"`
+	Generation uint64  `json:"generation"`
+	MinFee     uint64  `json:"min_fee"`
+	MaxFee     uint64  `json:"max_fee"`
+	AvgFee     float64 `json:"avg_fee"`
 }
 
 func (m *Mempool) Stats() MempoolStats {
@@ -464,8 +532,9 @@ func (m *Mempool) Stats() MempoolStats {
 	defer m.mu.RUnlock()
 
 	stats := MempoolStats{
-		Count:     len(m.txByID),
-		SizeBytes: m.totalSize,
+		Count:      len(m.txByID),
+		SizeBytes:  m.totalSize,
+		Generation: m.generation,
 	}
 
 	if stats.Count == 0 {
@@ -492,19 +561,22 @@ func (m *Mempool) GetAllEntries() []*MempoolEntry {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	// Copies, not the live entries: MempoolEntry.index is mutated by the
+	// priority queue, so a caller reading after the lock drops would race.
 	entries := make([]*MempoolEntry, 0, len(m.txByID))
 	for _, entry := range m.txByID {
-		entries = append(entries, entry)
+		snapshot := *entry
+		entries = append(entries, &snapshot)
 	}
 
-	// Sort by fee rate descending
-	for i := 0; i < len(entries)-1; i++ {
-		for j := i + 1; j < len(entries); j++ {
-			if entries[j].FeeRate > entries[i].FeeRate {
-				entries[i], entries[j] = entries[j], entries[i]
-			}
+	// Fee rate descending, then TxID, so equal-fee transactions keep a stable
+	// order instead of following map iteration.
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].FeeRate != entries[j].FeeRate {
+			return entries[i].FeeRate > entries[j].FeeRate
 		}
-	}
+		return bytes.Compare(entries[i].TxID[:], entries[j].TxID[:]) < 0
+	})
 
 	return entries
 }

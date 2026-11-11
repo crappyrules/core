@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/hex"
 	"fmt"
@@ -19,22 +20,86 @@ const (
 	checkpointsFilename = "checkpoints.dat"
 
 	// DefaultCheckpointsURL is where nodes fetch checkpoints when not in --full-sync mode.
-	// The file is served from a web host and is append-only.
+	// The file is served from a web host and contains finalized canonical blocks.
 	DefaultCheckpointsURL = "https://bntpool.com/checkpoints.dat"
 
 	// Keep downloads bounded in case of a misconfigured URL.
 	maxCheckpointsDownloadBytes = 32 << 20 // 32 MiB
+
+	checkpointRefreshInterval = 24 * time.Hour
 )
 
 func checkpointsPath(dataDir string) string {
 	return filepath.Join(dataDir, checkpointsFilename)
 }
 
+var checkpointsSource = DefaultCheckpointsURL
+
 func checkpointsURL() string {
-	if v := strings.TrimSpace(os.Getenv("BLOCKNET_CHECKPOINTS_URL")); v != "" {
-		return v
+	return checkpointsSource
+}
+
+type checkpointsRefresh struct {
+	checkpoints map[uint64][32]byte
+	maxHeight   uint64
+	replaced    bool
+}
+
+func refreshCheckpointsFile(ctx context.Context, path string) (checkpointsRefresh, error) {
+	var res checkpointsRefresh
+
+	url := strings.TrimSpace(checkpointsURL())
+	if url == "" {
+		return res, nil
 	}
-	return DefaultCheckpointsURL
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return res, fmt.Errorf("failed to build checkpoints request: %w", err)
+	}
+	req.Header.Set("Accept", "text/plain")
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return res, fmt.Errorf("failed to download checkpoints: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return res, fmt.Errorf("checkpoints download HTTP %d", resp.StatusCode)
+	}
+	remoteData, err := io.ReadAll(io.LimitReader(resp.Body, maxCheckpointsDownloadBytes))
+	if err != nil {
+		return res, fmt.Errorf("failed to read checkpoints: %w", err)
+	}
+	remote, _, remoteMax, err := parseCheckpoints(bytes.NewReader(remoteData))
+	if err != nil || len(remote) == 0 {
+		return res, err
+	}
+
+	localData, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return res, err
+	}
+	local, _, _, _ := parseCheckpoints(bytes.NewReader(localData))
+	stale := false
+	for h, hash := range remote {
+		if local[h] != hash {
+			stale = true
+			break
+		}
+	}
+	if !stale {
+		return res, nil
+	}
+
+	if localData != nil {
+		if err := os.WriteFile(path+".bak", localData, 0o644); err != nil {
+			return res, fmt.Errorf("failed to back up checkpoints: %w", err)
+		}
+	}
+	if err := replaceCheckpointsFile(path, remoteData); err != nil {
+		return res, fmt.Errorf("failed to publish checkpoints: %w", err)
+	}
+
+	return checkpointsRefresh{checkpoints: remote, maxHeight: remoteMax, replaced: true}, nil
 }
 
 func ensureCheckpointsFile(path string) (downloaded bool, err error) {
@@ -96,16 +161,27 @@ func ensureCheckpointsFile(path string) (downloaded bool, err error) {
 	return true, nil
 }
 
+func finalizedCheckpointHeight(tip uint64) uint64 {
+	if tip < MaxReorgDepth {
+		return 0
+	}
+	final := tip - MaxReorgDepth
+	return final - final%100
+}
+
 func loadCheckpointsFile(path string) (checkpoints map[uint64][32]byte, heights []uint64, maxHeight uint64, err error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, nil, 0, err
 	}
 	defer f.Close()
+	return parseCheckpoints(f)
+}
 
+func parseCheckpoints(r io.Reader) (checkpoints map[uint64][32]byte, heights []uint64, maxHeight uint64, err error) {
 	checkpoints = make(map[uint64][32]byte)
 
-	sc := bufio.NewScanner(f)
+	sc := bufio.NewScanner(r)
 	// Allow long lines defensively.
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 

@@ -3,10 +3,9 @@ package main
 import (
 	"encoding/json"
 	"testing"
-	"time"
 )
 
-func TestHandleTxPenalizesMalformedPayload(t *testing.T) {
+func TestHandleTxDoesNotBanForMalformedPayload(t *testing.T) {
 	chain, _, cleanup := mustCreateTestChain(t)
 	defer cleanup()
 	mustAddGenesisBlock(t, chain)
@@ -20,9 +19,12 @@ func TestHandleTxPenalizesMalformedPayload(t *testing.T) {
 		node:    receiver,
 	}
 
-	d.handleTx(sender.PeerID(), []byte("not-a-valid-serialized-tx"))
-
-	assertPeerPenalized(t, receiver, sender.PeerID(), 1)
+	if d.handleTx(sender.PeerID(), []byte("not-a-valid-serialized-tx")) {
+		t.Fatal("a malformed payload must not be relayed")
+	}
+	if receiver.IsBanned(sender.PeerID()) {
+		t.Fatal("a relay may have forwarded this payload in good faith")
+	}
 }
 
 func TestHandleBlockPenalizesCheapPrefilterFailure(t *testing.T) {
@@ -59,52 +61,6 @@ func TestHandleBlockPenalizesCheapPrefilterFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to marshal block: %v", err)
 	}
-
-	d.handleBlock(sender.PeerID(), data)
-
-	assertPeerPenalized(t, receiver, sender.PeerID(), 1)
-}
-
-func TestHandleBlockPenalizesRateLimitExceeded(t *testing.T) {
-	chain, _, cleanup := mustCreateTestChain(t)
-	defer cleanup()
-	mustAddGenesisBlock(t, chain)
-
-	sender, receiver, stopNodes := mustStartLinkedTestNodes(t)
-	defer stopNodes()
-
-	d := &Daemon{
-		chain:                 chain,
-		mempool:               NewMempool(DefaultMempoolConfig(), chain.IsKeyImageSpent, chain.IsCanonicalRingMember),
-		node:                  receiver,
-		gossipBlockLastAttempt: newGossipAttemptLRU(maxGossipBlockAttemptEntries),
-	}
-
-	genesis := chain.GetBlockByHeight(0)
-	if genesis == nil {
-		t.Fatal("expected genesis block")
-	}
-
-	block := &Block{
-		Header: BlockHeader{
-			Version:    1,
-			Height:     1,
-			PrevHash:   genesis.Hash(),
-			Timestamp:  genesis.Header.Timestamp + BlockIntervalSec,
-			Difficulty: MinDifficulty,
-		},
-		Transactions: []*Transaction{
-			{Version: 1, Inputs: nil, Outputs: nil},
-		},
-	}
-	data, err := json.Marshal(block)
-	if err != nil {
-		t.Fatalf("failed to marshal block: %v", err)
-	}
-
-	d.gossipBlockGateMu.Lock()
-	d.gossipBlockLastAttempt.Set(sender.PeerID(), time.Now())
-	d.gossipBlockGateMu.Unlock()
 
 	d.handleBlock(sender.PeerID(), data)
 

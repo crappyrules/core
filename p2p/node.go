@@ -17,6 +17,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/multiformats/go-multiaddr"
 )
@@ -53,6 +54,12 @@ type NodeConfig struct {
 	SeedMode bool
 }
 
+const (
+	// maxInboundStreamsPerPeer is far above what an honest peer holds at once.
+	maxInboundStreamsPerPeer = 64
+	chosenPeerProtectTag     = "chosen"
+)
+
 // DefaultNodeConfig returns sensible defaults
 func DefaultNodeConfig() NodeConfig {
 	return NodeConfig{
@@ -80,7 +87,7 @@ type Node struct {
 
 	// Handlers for received messages
 	onBlock func(from peer.ID, data []byte)
-	onTx    func(from peer.ID, data []byte)
+	onTx    func(from peer.ID, data []byte) bool
 
 	// Pending identity after rotation (applied on restart)
 	pendingKey crypto.PrivKey
@@ -100,12 +107,86 @@ func (n *Node) IsBanned(pid peer.ID) bool {
 	return n.pex.IsBanned(pid)
 }
 
+func (n *Node) IsWhitelisted(pid peer.ID) bool {
+	if n.pex == nil {
+		return false
+	}
+	return n.pex.IsWhitelisted(pid)
+}
+
 // BanPeer bans a peer for misbehavior
 func (n *Node) BanPeer(pid peer.ID, reason string) {
 	if n.pex == nil {
 		return
 	}
 	n.pex.BanPeer(pid, reason, BanDurationMedium)
+}
+
+// newResourceManager keeps libp2p's scaled defaults except for the streams one peer
+// may hold. Those defaults grow with host memory, which would let a single
+// connection fill the limits shared with every other peer.
+func newResourceManager() (network.ResourceManager, error) {
+	limits := rcmgr.DefaultLimits
+	libp2p.SetDefaultServiceLimits(&limits)
+	overrides := rcmgr.PartialLimitConfig{
+		PeerDefault: rcmgr.ResourceLimits{
+			StreamsInbound: rcmgr.LimitVal(maxInboundStreamsPerPeer),
+			Streams:        rcmgr.LimitVal(2 * maxInboundStreamsPerPeer),
+		},
+	}
+	return rcmgr.NewResourceManager(rcmgr.NewFixedLimiter(overrides.Build(limits.AutoScale())))
+}
+
+// protectChosenPeer keeps peers we dialed, and seeds, through connection trimming:
+// anyone can connect to us, so these links are the ones an attacker can't replace.
+func (n *Node) protectChosenPeer(c network.Conn) {
+	if n.host == nil {
+		return
+	}
+	pid := c.RemotePeer()
+	seed := n.pex != nil && n.pex.isSeed(pid)
+	if !seed && (c.Stat().Direction != network.DirOutbound || n.outboundPeerCount() > n.config.MaxOutbound) {
+		return
+	}
+	n.host.ConnManager().Protect(pid, chosenPeerProtectTag)
+}
+
+func (n *Node) releaseChosenPeer(c network.Conn) {
+	if n.host == nil {
+		return
+	}
+	pid := c.RemotePeer()
+	if len(n.host.Network().ConnsToPeer(pid)) == 0 {
+		n.host.ConnManager().Unprotect(pid, chosenPeerProtectTag)
+	}
+}
+
+// outboundPeerCount returns how many peers we hold a connection to that we dialed.
+func (n *Node) outboundPeerCount() int {
+	count := 0
+	for _, pid := range n.host.Network().Peers() {
+		if n.isDialedPeer(pid) {
+			count++
+		}
+	}
+	return count
+}
+
+// IsTrustedBlockSource reports whether a peer's block announcements deserve
+// priority: we dialed it, it is a seed or whitelisted, or it delivered a block we
+// accepted. Anyone else can connect for free.
+func (n *Node) IsTrustedBlockSource(pid peer.ID) bool {
+	return n.isDialedPeer(pid) || (n.pex != nil && n.pex.isTrustedBlockSource(pid))
+}
+
+// isDialedPeer reports whether we hold a connection to this peer that we dialed.
+func (n *Node) isDialedPeer(pid peer.ID) bool {
+	for _, c := range n.host.Network().ConnsToPeer(pid) {
+		if c.Stat().Direction == network.DirOutbound {
+			return true
+		}
+	}
+	return false
 }
 
 // PenalizePeer reduces a peer's reputation score
@@ -140,6 +221,13 @@ func (n *Node) BannedCount() int {
 	return n.pex.BannedPeerCount()
 }
 
+func (n *Node) SetBanWhitelist(ids []string) error {
+	if n.pex == nil {
+		return fmt.Errorf("peer exchange not ready")
+	}
+	return n.pex.SetBanWhitelist(ids)
+}
+
 // NewNode creates and starts a new P2P node
 func NewNode(cfg NodeConfig) (*Node, error) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -166,9 +254,10 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	}
 
 	// Create connection manager with limits
+	highWater := cfg.MaxInbound + cfg.MaxOutbound
 	connMgr, err := connmgr.NewConnManager(
-		cfg.MaxOutbound,                // low water
-		cfg.MaxInbound+cfg.MaxOutbound, // high water
+		max(cfg.MaxOutbound, highWater*3/4), // low water: trim a little, not most peers
+		highWater,
 		connmgr.WithGracePeriod(time.Minute),
 	)
 	if err != nil {
@@ -195,9 +284,16 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		return node.IsBanned(pid)
 	})
 
+	resourceManager, err := newResourceManager()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to create resource manager: %w", err)
+	}
+
 	// Create libp2p host with banned-peer admission gating enabled.
 	h, err := libp2p.New(
 		libp2p.Identity(privKey),
+		libp2p.ResourceManager(resourceManager),
 		libp2p.ListenAddrs(listenAddrs...),
 		libp2p.ConnectionManager(connMgr),
 		libp2p.ConnectionGater(banGater),
@@ -215,10 +311,14 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	}
 
 	node.host = h
+	h.Network().Notify(&network.NotifyBundle{
+		ConnectedF:    func(_ network.Network, c network.Conn) { node.protectChosenPeer(c) },
+		DisconnectedF: func(_ network.Network, c network.Conn) { node.releaseChosenPeer(c) },
+	})
 
 	// Set up identity rotation callback
 	identity.SetRotationCallback(func(newKey crypto.PrivKey, newID peer.ID) {
-		
+
 		node.mu.Lock()
 		node.pendingKey = newKey
 		node.pendingID = newID
@@ -299,6 +399,11 @@ func (n *Node) handleSyncStream(s network.Stream) {
 	// Sync protocol will be implemented with the sync handler
 }
 
+// SetSeedNodes replaces the bootstrap seed list. Call it before Start.
+func (n *Node) SetSeedNodes(seedAddrs []string) {
+	n.pex.setSeedNodes(seedAddrs)
+}
+
 // Start begins P2P operations (connecting to seeds, etc.)
 func (n *Node) Start() error {
 	// Start peer exchange (connects to seeds)
@@ -356,6 +461,7 @@ func (n *Node) Peers() []peer.ID {
 type PeerInfo struct {
 	ID    peer.ID
 	Addrs []string
+	Agent string
 }
 
 // PeerInfos returns connected peers with their remote multiaddrs.
@@ -364,6 +470,9 @@ func (n *Node) PeerInfos() []PeerInfo {
 	out := make([]PeerInfo, len(pids))
 	for i, pid := range pids {
 		info := PeerInfo{ID: pid}
+		if v, err := n.host.Peerstore().Get(pid, "AgentVersion"); err == nil {
+			info.Agent, _ = v.(string)
+		}
 		for _, conn := range n.host.Network().ConnsToPeer(pid) {
 			info.Addrs = append(info.Addrs, conn.RemoteMultiaddr().String())
 		}
@@ -385,7 +494,7 @@ func (n *Node) SetBlockHandler(handler func(from peer.ID, data []byte)) {
 }
 
 // SetTxHandler sets the callback for received transactions
-func (n *Node) SetTxHandler(handler func(from peer.ID, data []byte)) {
+func (n *Node) SetTxHandler(handler func(from peer.ID, data []byte) bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.onTx = handler
@@ -398,6 +507,12 @@ func (n *Node) SetTxHandler(handler func(from peer.ID, data []byte)) {
 // Invalid stem payloads are rejected before cache/relay in Dandelion.
 func (n *Node) SetStemSanityValidator(validator func(data []byte) bool) {
 	n.dandel.SetStemSanityValidator(validator)
+}
+
+// SetStemRelayFilter sets a check that drops stem payloads without penalizing
+// the sender.
+func (n *Node) SetStemRelayFilter(filter func(data []byte) bool) {
+	n.dandel.SetStemRelayFilter(filter)
 }
 
 // BroadcastBlock sends a block to all connected peers

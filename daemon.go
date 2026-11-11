@@ -1,19 +1,19 @@
 package main
 
 import (
-	"container/list"
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
-	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"blocknet/p2p"
@@ -55,11 +55,17 @@ type Daemon struct {
 
 	// Explorer
 	explorerAddr string
+	explorerMu   sync.Mutex
+	explorer     *Explorer
+	explorerSrv  *http.Server
 
 	// Checkpoints
-	saveCheckpoints       bool
-	checkpointsFile       string
-	lastCheckpointWritten uint64
+	saveCheckpoints        atomic.Bool
+	checkpointsFile        string
+	lastCheckpointWritten  uint64
+	checkpointMu           sync.Mutex
+	checkpointsInitialized bool
+	fullSync               bool
 
 	// Self-heal info (set during NewDaemon if chain was truncated)
 	repairTruncatedTo uint64
@@ -76,21 +82,22 @@ type Daemon struct {
 	cancel context.CancelFunc
 
 	// Guards expensive gossip block validation to bound CPU/RAM pressure.
-	gossipBlockGateMu      sync.Mutex
-	gossipBlockInFlight    int
-	gossipBlockLastAttempt *gossipAttemptLRU
+	blockIntakeMu        sync.Mutex
+	blockIntakeInFlight  map[[32]byte]struct{}
+	blockIntakeUntrusted bool
+	blockIntakePending   int
+
+	// Startup tip-freshness gate for mining templates (templateTipChecked).
+	syncStartedAt  atomic.Pointer[time.Time] // set when Start launches sync
+	tipGateOpen    atomic.Bool
+	tipGateNow     func() time.Time // nil means time.Now
+	peerTipChecked func() bool      // nil means syncMgr.PeerTipChecked
+
+	// Supplies seed nodes right before P2P dialing (DaemonConfig.ResolveSeedNodes).
+	resolveSeedNodes func() []string
 }
 
-const (
-	// Keep expensive gossip validation bounded under announcement floods.
-	maxConcurrentGossipBlockValidations = 1
-	minGossipBlockValidationInterval    = 3 * time.Second
-
-	// Bound per-peer rate limit memory under peer-id churn.
-	// LRU eviction keeps active peers hot while bounding growth.
-	maxGossipBlockAttemptEntries = 4096
-	gossipBlockAttemptTTL        = 30 * time.Minute
-)
+const ()
 
 func verifyStoredGenesisMatchesRelaunchGenesis(chain *Chain) error {
 	if chain == nil {
@@ -124,79 +131,15 @@ type gossipAttemptEntry struct {
 	last time.Time
 }
 
-type gossipAttemptLRU struct {
-	cap   int
-	lru   *list.List // front=MRU, back=LRU; values are gossipAttemptEntry
-	index map[peer.ID]*list.Element
-}
-
-func newGossipAttemptLRU(cap int) *gossipAttemptLRU {
-	if cap < 1 {
-		cap = 1
-	}
-	return &gossipAttemptLRU{
-		cap:   cap,
-		lru:   list.New(),
-		index: make(map[peer.ID]*list.Element, min(cap, 1024)),
-	}
-}
-
-func (c *gossipAttemptLRU) PurgeBefore(cutoff time.Time) {
-	if c == nil {
-		return
-	}
-	for {
-		back := c.lru.Back()
-		if back == nil {
-			return
-		}
-		ent := back.Value.(gossipAttemptEntry)
-		if ent.last.After(cutoff) {
-			return
-		}
-		c.lru.Remove(back)
-		delete(c.index, ent.pid)
-	}
-}
-
-func (c *gossipAttemptLRU) Get(pid peer.ID) (time.Time, bool) {
-	if c == nil {
-		return time.Time{}, false
-	}
-	if elem, ok := c.index[pid]; ok {
-		c.lru.MoveToFront(elem)
-		ent := elem.Value.(gossipAttemptEntry)
-		return ent.last, true
-	}
-	return time.Time{}, false
-}
-
-func (c *gossipAttemptLRU) Set(pid peer.ID, t time.Time) {
-	if c == nil {
-		return
-	}
-	if elem, ok := c.index[pid]; ok {
-		elem.Value = gossipAttemptEntry{pid: pid, last: t}
-		c.lru.MoveToFront(elem)
-	} else {
-		c.index[pid] = c.lru.PushFront(gossipAttemptEntry{pid: pid, last: t})
-	}
-	for c.lru.Len() > c.cap {
-		back := c.lru.Back()
-		if back == nil {
-			break
-		}
-		ent := back.Value.(gossipAttemptEntry)
-		c.lru.Remove(back)
-		delete(c.index, ent.pid)
-	}
-}
-
 // DaemonConfig configures the daemon
 type DaemonConfig struct {
 	// P2P settings
 	ListenAddrs []string
 	SeedNodes   []string
+	// ResolveSeedNodes, when set, is called by Start right before P2P dialing
+	// and its result replaces SeedNodes. Seed discovery can take seconds, and
+	// nothing before dialing needs it, so it no longer delays the API.
+	ResolveSeedNodes  func() []string
 	P2PWhitelistPeers []string
 	// Optional P2P peer limits (0 uses p2p defaults)
 	P2PMaxInbound  int
@@ -215,26 +158,24 @@ type DaemonConfig struct {
 	// Checkpoints
 	SaveCheckpoints bool
 	FullSync        bool
+
+	IdentityKeyPath string
+	ChainCacheCap   int
 }
 
 // DefaultSeedNodes are the hardcoded bootstrap nodes
 var DefaultSeedNodes = []string{
 	"/ip4/46.62.203.242/tcp/28080/p2p/12D3KooWQUNGJrsU5nRXNk45FT3ZumdtWC9Sg9Xt2AgU3XkP382R",
 	"/ip4/46.62.243.192/tcp/28080/p2p/12D3KooWSQTy8rav5nmapgxomAMpSrigJTUXHmjH25dtHhGU3BAM",
-	"/ip4/46.62.252.254/tcp/28080/p2p/12D3KooWCJzbwahELLrssLMbvxCXAp2HeeH1nPTYHH1kFERZxxb8",
-	"/ip4/46.62.202.165/tcp/28080/p2p/12D3KooWSAWJofx3Gk9Rbgs5UQFsUVCDkMDybr85v2j5gN3ocnUL",
-	"/ip4/46.62.249.240/tcp/28080/p2p/12D3KooWKSgY1tDEfTNXo7AEE3tzsrnieEHmcUjYJfGz1LF72UJt",
-	"/ip4/46.62.201.220/tcp/28080/p2p/12D3KooWPMeQZB8pJTavN6KXJ12LpMYfBSYDkV1md2xsYaWC8VMa",
+	"/ip4/135.181.47.224/tcp/28080/p2p/12D3KooWLRJWWeBK3Fcd4zuw2GAC3SQEbMXpMFYedAkSWCShPeeM",
+	"/ip4/69.164.251.242/tcp/28080/p2p/12D3KooWJrLG1Y71bzVSTCpwyhjbJNUB8LjpWCYNQsMgEuWkH4LE",
+	"/ip4/74.208.222.246/tcp/28080/p2p/12D3KooWSTdNQFi3NuP9EgTHBSSDiPuk3uMT97JqYaqQuuyhBgJx",
 }
 
 // DefaultTestnetSeedNodes are the hardcoded testnet bootstrap nodes.
 var DefaultTestnetSeedNodes = []string{
 	"/ip4/46.62.203.242/tcp/38080/p2p/12D3KooWCEsiN7zKfWWq1rWVC9bseiDtnA1ohykXqJmmBvkQs7Sd",
 	"/ip4/46.62.243.192/tcp/38080/p2p/12D3KooWRowneDC78ZuMJEZiZ39x39yPZweh3CGKgo49C6KacL2H",
-	"/ip4/46.62.252.254/tcp/38080/p2p/12D3KooWSffcGmmgMM2G8sYWwdpdPKejWWk8nn5yHKAkaonH73Ap",
-	"/ip4/46.62.202.165/tcp/38080/p2p/12D3KooWRWTaJB23jPk6ZAv4WAHuwbW7DH29SNMDNVSkH5q6SQem",
-	"/ip4/46.62.249.240/tcp/38080/p2p/12D3KooWDKsiuCxjyLUQo2JnG9AA14EPrVPZrVMQaY4VFX5pbFXP",
-	"/ip4/46.62.201.220/tcp/38080/p2p/12D3KooWDFnzMzKEmhPgzgYYW3zrHcQcxvC6shRK6HA7XfFdvg7L",
 }
 
 // DefaultDaemonConfig returns sensible defaults
@@ -264,8 +205,12 @@ func NewDaemon(cfg DaemonConfig, stealthKeys *StealthKeys) (*Daemon, error) {
 		}
 	}
 
+	startup := newStartupTimer()
+	defer startup.done()
+
 	// Create chain with persistent storage
-	chain, err := NewChain(cfg.DataDir)
+	chain, err := NewChainWithCacheCap(cfg.DataDir, cfg.ChainCacheCap)
+	startup.stage("open_chain")
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("failed to create chain: %w", err)
@@ -302,6 +247,8 @@ func NewDaemon(cfg DaemonConfig, stealthKeys *StealthKeys) (*Daemon, error) {
 		}
 	}
 
+	startup.stage("genesis_check")
+
 	// Track self-heal info for caller to report.
 	var repairTruncatedTo uint64
 	var repairViolations int
@@ -325,6 +272,8 @@ func NewDaemon(cfg DaemonConfig, stealthKeys *StealthKeys) (*Daemon, error) {
 			// non-fatal: proceed without checkpoints
 		}
 	}
+
+	startup.stage("load_checkpoints")
 
 	// Enable checkpoint fast-sync (skip expensive PoW up to last checkpoint) while
 	// we're still below that height. This is trust-based and can be bypassed via
@@ -357,6 +306,8 @@ func NewDaemon(cfg DaemonConfig, stealthKeys *StealthKeys) (*Daemon, error) {
 		}
 	}
 
+	startup.stage("verify_chain")
+
 	// Create mempool (uses chain's key image checker)
 	mempool := NewMempool(DefaultMempoolConfig(), chain.IsKeyImageSpent, chain.IsCanonicalRingMember)
 
@@ -380,6 +331,7 @@ func NewDaemon(cfg DaemonConfig, stealthKeys *StealthKeys) (*Daemon, error) {
 		nodeCfg.MaxOutbound = cfg.P2PMaxOutbound
 	}
 	nodeCfg.SeedMode = cfg.SeedMode
+	nodeCfg.Identity.KeyPath = cfg.IdentityKeyPath
 
 	node, err := p2p.NewNode(nodeCfg)
 	if err != nil {
@@ -387,48 +339,41 @@ func NewDaemon(cfg DaemonConfig, stealthKeys *StealthKeys) (*Daemon, error) {
 		return nil, fmt.Errorf("failed to create P2P node: %w", err)
 	}
 
+	startup.stage("p2p_node")
+
 	// Wire up peer count for miner (skip mining when no peers)
 	miner.config.PeerCount = func() int { return len(node.Peers()) }
 
 	d := &Daemon{
-		chain:                  chain,
-		mempool:                mempool,
-		miner:                  miner,
-		node:                   node,
-		stealthKeys:            stealthKeys,
-		saveCheckpoints:        cfg.SaveCheckpoints,
-		checkpointsFile:        checkpointsPath(cfg.DataDir),
-		repairTruncatedTo:      repairTruncatedTo,
-		repairViolations:       repairViolations,
-		repairFailed:           repairFailed,
-		ctx:                    ctx,
-		cancel:                 cancel,
-		seedMode:               cfg.SeedMode,
-		listenAddrs:            cfg.ListenAddrs,
-		gossipBlockLastAttempt: newGossipAttemptLRU(maxGossipBlockAttemptEntries),
+		chain:             chain,
+		mempool:           mempool,
+		miner:             miner,
+		node:              node,
+		stealthKeys:       stealthKeys,
+		checkpointsFile:   checkpointsPath(cfg.DataDir),
+		fullSync:          cfg.FullSync,
+		repairTruncatedTo: repairTruncatedTo,
+		repairViolations:  repairViolations,
+		repairFailed:      repairFailed,
+		ctx:               ctx,
+		cancel:            cancel,
+		seedMode:          cfg.SeedMode,
+		listenAddrs:       cfg.ListenAddrs,
+		resolveSeedNodes:  cfg.ResolveSeedNodes,
 	}
 
 	// Create sync manager with callbacks
 	syncCfg := p2p.SyncConfig{
-		GetStatus:         d.getChainStatus,
-		GetHeaders:        d.getHeaders,
-		GetBlocks:         d.getBlocks,
-		GetBlocksByHeight: d.getBlocksByHeight,
-		ProcessBlock:      d.processBlockData,
-		ProcessHeader:     nil, // Full-block sync, no header processing
-		GetMempool:        d.getMempoolTxs,
-		ProcessTx:         d.processTxData,
-		IsOrphanError: func(err error) bool {
-			if errors.Is(err, ErrOrphanBlock) {
-				return true
-			}
-			// "incomplete chain" means we're missing ancestor blocks locally —
-			// this is our problem, not the peer's. Don't penalize them.
-			if err != nil && strings.Contains(err.Error(), "incomplete chain") {
-				return true
-			}
-			return false
-		},
+		GetStatus:             d.getChainStatus,
+		GetHeaders:            d.getHeaders,
+		GetBlocks:             d.getBlocks,
+		GetBlocksByHeight:     d.getBlocksByHeight,
+		ProcessBlock:          d.processBlockData,
+		ProcessHeader:         nil, // Full-block sync, no header processing
+		GetMempool:            d.getMempoolTxs,
+		ProcessTx:             d.processTxData,
+		ProcessAnnouncedBlock: d.processAnnouncedBlock,
+		IsOrphanError:         isOrphanBlockError,
 		IsDuplicateError: func(err error) bool {
 			return errors.Is(err, ErrDuplicateBlock) || errors.Is(err, ErrSideChainBlock)
 		},
@@ -446,13 +391,6 @@ func NewDaemon(cfg DaemonConfig, stealthKeys *StealthKeys) (*Daemon, error) {
 			}
 			return block.Hash(), nil
 		},
-		OnBlockAccepted: func(data []byte) {
-			d.miner.NotifyNewBlock()
-			var block Block
-			if err := json.Unmarshal(data, &block); err == nil {
-				d.notifyBlock(&block)
-			}
-		},
 	}
 	d.syncMgr = p2p.NewSyncManager(node, syncCfg)
 
@@ -463,16 +401,15 @@ func NewDaemon(cfg DaemonConfig, stealthKeys *StealthKeys) (*Daemon, error) {
 		_, err := DeserializeTx(data)
 		return err == nil
 	})
+	node.SetStemRelayFilter(isRelayableStemTx)
 
 	// Store explorer config
 	d.explorerAddr = cfg.ExplorerAddr
 
-	// Initialize checkpoint writer state (best-effort).
-	if d.saveCheckpoints {
-		if _, _, maxH, err := loadCheckpointsFile(d.checkpointsFile); err == nil && maxH > 0 {
-			d.lastCheckpointWritten = maxH
-		}
-	}
+	d.SetSaveCheckpoints(cfg.SaveCheckpoints)
+
+	startup.stage("daemon_wiring")
+	d.maybeSaveCheckpoints()
 
 	return d, nil
 }
@@ -551,11 +488,17 @@ func (d *Daemon) notifyMinedBlock(block *Block) {
 
 // Start begins daemon operations
 func (d *Daemon) Start() error {
+	if d.resolveSeedNodes != nil {
+		seedsStartedAt := time.Now()
+		d.node.SetSeedNodes(d.resolveSeedNodes())
+		log.Printf("[perf] startup stage=resolve_seed_nodes waited=%s", time.Since(seedsStartedAt).Round(time.Millisecond))
+	}
+
 	// Start P2P node
 	if err := d.node.Start(); err != nil {
 		// Bootstrap assist: if enabled, write peer.txt even when we couldn't connect to seeds.
 		// This lets operators capture the peer ID for seed lists.
-		if strings.TrimSpace(os.Getenv("BLOCKNET_EXPORT_PEER_ON_START_FAIL")) != "" {
+		if d.seedMode {
 			if werr := d.node.WritePeerFile("peer.txt"); werr != nil {
 				log.Printf("Warning: failed to write peer.txt on start failure: %v", werr)
 			}
@@ -571,24 +514,59 @@ func (d *Daemon) Start() error {
 	}
 
 	// Start sync manager
+	syncStartedAt := time.Now()
+	d.syncStartedAt.Store(&syncStartedAt)
 	d.syncMgr.Start(d.ctx)
 
-	// Start explorer if configured
-	if d.explorerAddr != "" {
-		explorer := NewExplorer(d)
-		go func() {
-			if err := explorer.Start(d.explorerAddr); err != nil {
-				log.Printf("Explorer error: %v", err)
-			}
-		}()
+	if !d.fullSync {
+		go d.checkpointRefreshLoop()
+	}
+
+	if err := d.SetExplorerAddr(d.explorerAddr); err != nil {
+		log.Printf("Explorer error: %v", err)
 	}
 
 	return nil
 }
 
+func (d *Daemon) checkpointRefreshLoop() {
+	ticker := time.NewTicker(checkpointRefreshInterval)
+	defer ticker.Stop()
+	for {
+		d.refreshCheckpoints()
+		select {
+		case <-d.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (d *Daemon) refreshCheckpoints() {
+	d.checkpointMu.Lock()
+	defer d.checkpointMu.Unlock()
+	if d.saveCheckpoints.Load() || d.checkpointsFile == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(d.ctx, 30*time.Second)
+	defer cancel()
+	res, err := refreshCheckpointsFile(ctx, d.checkpointsFile)
+	if err != nil {
+		log.Printf("Checkpoints refresh failed: %v", err)
+		return
+	}
+	if res.replaced {
+		d.checkpointsInitialized = false
+		d.chain.SetTrustedCheckpoints(res.checkpoints, res.maxHeight)
+		log.Printf("Checkpoints updated from %s (%d entries, max %d, old file saved as %s.bak)", checkpointsURL(), len(res.checkpoints), res.maxHeight, d.checkpointsFile)
+	}
+}
+
 // Stop gracefully shuts down the daemon
 func (d *Daemon) Stop() error {
 	d.cancel()
+
+	_ = d.SetExplorerAddr("")
 
 	if d.peerIDServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -652,21 +630,21 @@ func (d *Daemon) handleBlock(from peer.ID, data []byte) {
 		d.penalizeInvalidGossipPeer(from, p2p.ScorePenaltyMisbehave, fmt.Sprintf("block prefilter failed: %v", err))
 		return
 	}
-	if err := d.acquireGossipBlockValidationSlot(from); err != nil {
-		d.penalizeInvalidGossipPeer(from, p2p.ScorePenaltyMisbehave, err.Error())
+	preverification, finishIntake, err := d.verifyAnnouncedBlock(from, &block)
+	defer finishIntake()
+	if err != nil {
+		d.handleAnnouncedBlockRejection(from, &block, err)
 		return
 	}
-	defer d.releaseGossipBlockValidationSlot()
 
 	d.mu.Lock()
 
 	prevBest := d.chain.BestHash()
-	accepted, isMainChain, err := d.chain.ProcessBlock(&block)
+	accepted, isMainChain, err := d.chain.ProcessPreverifiedBlock(&block, preverification)
 	if err != nil || !accepted {
 		d.mu.Unlock()
 		if err != nil {
-			log.Printf("Rejected announced block at height %d from %s: %v", block.Header.Height, from.String()[:8], err)
-			d.penalizeInvalidGossipPeer(from, p2p.ScorePenaltyMisbehave, fmt.Sprintf("invalid block: %v", err))
+			d.handleAnnouncedBlockRejection(from, &block, err)
 		}
 		return
 	}
@@ -676,43 +654,177 @@ func (d *Daemon) handleBlock(from peer.ID, data []byte) {
 		return
 	}
 
+	// Peers need nothing from the mempool update, so the block goes out first.
+	d.node.RelayBlock(from, data)
 	d.updateMempoolForAcceptedMainChain(&block, prevBest)
-	cp := d.prepareCheckpointLocked(&block)
 	d.mu.Unlock()
 
-	writeCheckpoint(cp)
-	d.node.RelayBlock(from, data)
 	d.notifyBlock(&block)
 	d.miner.NotifyNewBlock()
+	d.maybeSaveCheckpoints()
 }
 
-// handleTx processes a transaction from a peer (fluff phase)
-func (d *Daemon) handleTx(from peer.ID, data []byte) {
+// errBlockIntakeBusy means an announced block wasn't verified because the slot for
+// peers without a track record is taken. It counts as a duplicate: nothing is
+// wrong with the block or its sender, and a peer we trust or a sync can deliver it.
+var errBlockIntakeBusy = fmt.Errorf("%w: block intake busy", ErrDuplicateBlock)
+
+func isOrphanBlockError(err error) bool {
+	if errors.Is(err, ErrOrphanBlock) {
+		return true
+	}
+	// "incomplete chain" means we're missing ancestor blocks locally: this is our
+	// problem, not the peer's.
+	return err != nil && strings.Contains(err.Error(), "incomplete chain")
+}
+
+// maxPendingBlockVerifications bounds announced blocks verifying or queued to. Past
+// it they are dropped and a sync check fetches anything real, so a flood can't build
+// up minutes of work that outlives the peers who sent it.
+const maxPendingBlockVerifications = 4
+
+// verifyAnnouncedBlock checks an announced block's proof of work and signatures
+// with no lock held, so announcements can't delay real blocks or our own
+// submissions. Each block is verified once at a time, and peers without a track
+// record share one slot, so they can't crowd out peers we trust. The returned
+// function must always be called.
+func (d *Daemon) verifyAnnouncedBlock(from peer.ID, block *Block) (BlockPreverification, func(), error) {
+	hash := block.Hash()
+	noop := func() {}
+	if d.chain.HasBlock(hash) {
+		return BlockPreverification{}, noop, ErrDuplicateBlock
+	}
+
+	d.blockIntakeMu.Lock()
+	if d.blockIntakeInFlight == nil {
+		d.blockIntakeInFlight = make(map[[32]byte]struct{})
+	}
+	if _, busy := d.blockIntakeInFlight[hash]; busy {
+		d.blockIntakeMu.Unlock()
+		return BlockPreverification{}, noop, ErrDuplicateBlock
+	}
+	d.blockIntakeInFlight[hash] = struct{}{}
+	d.blockIntakeMu.Unlock()
+
+	holdsUntrusted, holdsPending := false, false
+	finish := func() {
+		d.blockIntakeMu.Lock()
+		defer d.blockIntakeMu.Unlock()
+		delete(d.blockIntakeInFlight, hash)
+		if holdsUntrusted {
+			d.blockIntakeUntrusted = false
+		}
+		if holdsPending {
+			d.blockIntakePending--
+		}
+	}
+
+	if !d.chain.NeedsPreverification(block) {
+		return BlockPreverification{}, finish, nil
+	}
+	trusted := d.node == nil || d.node.IsTrustedBlockSource(from)
+	d.blockIntakeMu.Lock()
+	if d.blockIntakePending >= maxPendingBlockVerifications || (!trusted && d.blockIntakeUntrusted) {
+		d.blockIntakeMu.Unlock()
+		if d.syncMgr != nil {
+			d.syncMgr.RequestSyncCheck()
+		}
+		return BlockPreverification{}, finish, errBlockIntakeBusy
+	}
+	d.blockIntakePending++
+	holdsPending = true
+	if !trusted {
+		d.blockIntakeUntrusted = true
+		holdsUntrusted = true
+	}
+	d.blockIntakeMu.Unlock()
+	preverification, err := d.chain.PreverifyBlock(block)
+	return preverification, finish, err
+}
+
+// handleAnnouncedBlockRejection decides what a rejected block on the gossip
+// protocol means for its sender. Only a block that is itself invalid counts.
+func (d *Daemon) handleAnnouncedBlockRejection(from peer.ID, block *Block, err error) {
+	switch {
+	case errors.Is(err, ErrDuplicateBlock):
+	case isOrphanBlockError(err):
+		if d.syncMgr != nil {
+			d.syncMgr.RequestSyncCheck()
+		}
+	default:
+		log.Printf("Rejected announced block at height %d from %s: %v", block.Header.Height, from.String()[:8], err)
+		d.penalizeInvalidGossipPeer(from, p2p.ScorePenaltyMisbehave, fmt.Sprintf("invalid block: %v", err))
+	}
+}
+
+// processAnnouncedBlock handles a block announced on the sync protocol. Once the
+// block is accepted, the sync manager relays it and then runs the returned
+// function, which notifies subscribers and saves checkpoints.
+func (d *Daemon) processAnnouncedBlock(from peer.ID, data []byte) (func(), error) {
+	var block Block
+	if err := json.Unmarshal(data, &block); err != nil {
+		return nil, err
+	}
+	if err := validateBlockCheapPrefilters(&block); err != nil {
+		return nil, fmt.Errorf("rejected p2p block at height %d: %w", block.Header.Height, err)
+	}
+	preverification, finishIntake, err := d.verifyAnnouncedBlock(from, &block)
+	defer finishIntake()
+	if err != nil {
+		return nil, wrapBlockRejection(&block, err)
+	}
+	if err := d.acceptVerifiedBlock(&block, preverification); err != nil {
+		return nil, err
+	}
+	return func() {
+		d.miner.NotifyNewBlock()
+		d.notifyBlock(&block)
+		d.maybeSaveCheckpoints()
+	}, nil
+}
+
+func wrapBlockRejection(block *Block, err error) error {
+	if errors.Is(err, ErrDuplicateBlock) {
+		return err
+	}
+	return fmt.Errorf("rejected p2p block at height %d: %w", block.Header.Height, err)
+}
+
+// handleTx processes a transaction that reached fluff phase and reports whether
+// it is in the mempool, which is what lets it be relayed. A rejection doesn't
+// penalize the sender: older relays forward transactions without validating them,
+// and a tx can also fail only because this node is behind or just saw a conflict.
+// The router limits how many rejected transactions it takes from one peer.
+func (d *Daemon) handleTx(_ peer.ID, data []byte) bool {
 	tx, err := DeserializeTx(data)
 	if err != nil {
-		d.penalizeInvalidGossipPeer(from, p2p.ScorePenaltyMisbehave, "malformed transaction payload")
-		return
+		return false
 	}
 	txID, err := tx.TxID()
 	if err != nil {
-		d.penalizeInvalidGossipPeer(from, p2p.ScorePenaltyMisbehave, "invalid transaction id")
-		return
+		return false
 	}
 	if d.mempool.HasTransaction(txID) {
-		return
+		return true
 	}
+	return d.mempool.AddTransaction(tx, data) == nil
+}
 
-	if err := d.mempool.AddTransaction(tx, data); err != nil {
-		if shouldPenalizeTxGossipRejection(err) {
-			d.penalizeInvalidGossipPeer(from, p2p.ScorePenaltyMisbehave, fmt.Sprintf("invalid transaction: %v", err))
-		}
-		return
-	}
+// isRelayableStemTx reports whether a stem payload could enter a mempool: one with
+// no inputs never can, so it stops here instead of continuing along the stem.
+func isRelayableStemTx(data []byte) bool {
+	tx, err := DeserializeTx(data)
+	return err == nil && !tx.IsCoinbase()
 }
 
 func validateBlockCheapPrefilters(block *Block) error {
 	if block == nil {
 		return fmt.Errorf("nil block")
+	}
+	// A JSON null decodes to a nil entry, so this must come before anything that
+	// reads the transactions.
+	if slices.Contains(block.Transactions, nil) {
+		return fmt.Errorf("block contains a null transaction")
 	}
 	if block.Header.Version == 0 {
 		return fmt.Errorf("invalid block version")
@@ -737,9 +849,6 @@ func validateBlockCheapPrefilters(block *Block) error {
 	// silently defaults to all-zero bytes. Reject that at the cheap prefilter
 	// boundary so we don't waste expensive validation on policy-invalid blocks.
 	for ti, tx := range block.Transactions {
-		if tx == nil {
-			return fmt.Errorf("nil transaction at index %d", ti)
-		}
 		for oi, out := range tx.Outputs {
 			allZero := true
 			for _, b := range out.EncryptedMemo[:] {
@@ -756,16 +865,6 @@ func validateBlockCheapPrefilters(block *Block) error {
 	return nil
 }
 
-func shouldPenalizeTxGossipRejection(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "validation failed:") ||
-		strings.Contains(msg, "coinbase transaction cannot be added to mempool") ||
-		strings.Contains(msg, "double-spend: key image already in mempool")
-}
-
 func (d *Daemon) penalizeInvalidGossipPeer(pid peer.ID, penalty int, reason string) {
 	if d.node == nil || pid == "" {
 		return
@@ -779,65 +878,34 @@ func (d *Daemon) penalizeInvalidGossipPeer(pid peer.ID, penalty int, reason stri
 	d.node.PenalizePeer(pid, penalty, reason)
 }
 
-func (d *Daemon) acquireGossipBlockValidationSlot(pid peer.ID) error {
-	d.gossipBlockGateMu.Lock()
-	defer d.gossipBlockGateMu.Unlock()
-
-	if d.gossipBlockLastAttempt == nil {
-		d.gossipBlockLastAttempt = newGossipAttemptLRU(maxGossipBlockAttemptEntries)
-	}
-
-	now := time.Now()
-	d.gossipBlockLastAttempt.PurgeBefore(now.Add(-gossipBlockAttemptTTL))
-
-	if last, ok := d.gossipBlockLastAttempt.Get(pid); ok && now.Sub(last) < minGossipBlockValidationInterval {
-		return fmt.Errorf("block gossip rate limit exceeded")
-	}
-	if d.gossipBlockInFlight >= maxConcurrentGossipBlockValidations {
-		return fmt.Errorf("block gossip validation busy")
-	}
-
-	d.gossipBlockLastAttempt.Set(pid, now)
-	d.gossipBlockInFlight++
-	return nil
-}
-
-func (d *Daemon) releaseGossipBlockValidationSlot() {
-	d.gossipBlockGateMu.Lock()
-	defer d.gossipBlockGateMu.Unlock()
-	if d.gossipBlockInFlight > 0 {
-		d.gossipBlockInFlight--
-	}
-}
-
 // Chain status callbacks for sync manager
 
 func (d *Daemon) getChainStatus() p2p.ChainStatus {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	height, bestHash, totalWork := d.chain.TipFast()
+	if bestHash == ([32]byte{}) {
+		bestHash, height, totalWork = d.chain.BestHash(), d.chain.Height(), d.chain.TotalWork()
+	}
 
 	return p2p.ChainStatus{
-		BestHash:  d.chain.BestHash(),
-		Height:    d.chain.Height(),
-		TotalWork: d.chain.TotalWork(),
-		Version:   1,
-		NetworkID: params.NetworkID,
-		ChainID:   params.ChainID,
+		BestHash:      bestHash,
+		Height:        height,
+		TotalWork:     totalWork,
+		Version:       1,
+		NetworkID:     params.NetworkID,
+		ChainID:       params.ChainID,
+		TipDifficulty: d.chain.TipDifficultyFast(),
 	}
 }
 
 func (d *Daemon) getHeaders(startHeight uint64, max int) ([][]byte, error) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	stored, err := d.chain.Storage().GetMainChainHeaders(startHeight, max)
+	if err != nil {
+		return nil, err
+	}
 
-	var headers [][]byte
-	for h := startHeight; h <= d.chain.Height() && len(headers) < max; h++ {
-		block := d.chain.GetBlockByHeight(h)
-		if block == nil {
-			break
-		}
-
-		headerData, err := json.Marshal(block.Header)
+	headers := make([][]byte, 0, len(stored))
+	for i := range stored {
+		headerData, err := json.Marshal(stored[i])
 		if err != nil {
 			continue
 		}
@@ -848,21 +916,14 @@ func (d *Daemon) getHeaders(startHeight uint64, max int) ([][]byte, error) {
 }
 
 func (d *Daemon) getBlocks(hashes [][32]byte) ([][]byte, error) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
 	var blocks [][]byte
 	for _, hash := range hashes {
-		block := d.chain.GetBlock(hash)
+		block := d.chain.GetBlockFast(hash)
 		if block == nil {
 			continue
 		}
 
-		blockData, err := json.Marshal(block)
-		if err != nil {
-			continue
-		}
-		blocks = append(blocks, blockData)
+		blocks = append(blocks, marshalBlockJSON(block))
 	}
 
 	return blocks, nil
@@ -876,14 +937,31 @@ func (d *Daemon) processBlockData(data []byte) error {
 	if err := validateBlockCheapPrefilters(&block); err != nil {
 		return fmt.Errorf("rejected p2p block at height %d: %w", block.Header.Height, err)
 	}
+	preverification, err := d.chain.PreverifyBlock(&block)
+	if err != nil {
+		return wrapBlockRejection(&block, err)
+	}
+	return d.commitVerifiedBlock(&block, preverification)
+}
 
+// commitVerifiedBlock adds a block whose expensive checks already ran.
+func (d *Daemon) commitVerifiedBlock(block *Block, preverification BlockPreverification) error {
+	if err := d.acceptVerifiedBlock(block, preverification); err != nil {
+		return err
+	}
+	d.maybeSaveCheckpoints()
+	return nil
+}
+
+// acceptVerifiedBlock is commitVerifiedBlock without the checkpoint save.
+func (d *Daemon) acceptVerifiedBlock(block *Block, preverification BlockPreverification) error {
 	d.mu.Lock()
 
 	prevBest := d.chain.BestHash()
-	accepted, isMainChain, err := d.chain.ProcessBlock(&block)
+	accepted, isMainChain, err := d.chain.ProcessPreverifiedBlock(block, preverification)
 	if err != nil {
 		d.mu.Unlock()
-		return fmt.Errorf("rejected p2p block at height %d: %w", block.Header.Height, err)
+		return wrapBlockRejection(block, err)
 	}
 	if !accepted {
 		d.mu.Unlock()
@@ -895,63 +973,49 @@ func (d *Daemon) processBlockData(data []byte) error {
 		return ErrSideChainBlock
 	}
 
-	d.updateMempoolForAcceptedMainChain(&block, prevBest)
-	cp := d.prepareCheckpointLocked(&block)
+	d.updateMempoolForAcceptedMainChain(block, prevBest)
 	d.mu.Unlock()
-
-	writeCheckpoint(cp)
 	return nil
 }
 
-type checkpointEntry struct {
-	height uint64
-	line   string
-	file   string
+func (d *Daemon) SetSaveCheckpoints(enabled bool) {
+	d.saveCheckpoints.Store(enabled)
 }
 
-// prepareCheckpointLocked checks whether a checkpoint should be written and
-// returns the entry to write. Caller must hold d.mu. The actual file I/O
-// should happen after releasing d.mu via writeCheckpoint.
-func (d *Daemon) prepareCheckpointLocked(block *Block) *checkpointEntry {
-	if !d.saveCheckpoints || block == nil {
+func (d *Daemon) SetExplorerAddr(addr string) error {
+	d.explorerMu.Lock()
+	defer d.explorerMu.Unlock()
+	if d.explorerSrv != nil && addr == d.explorerAddr {
 		return nil
 	}
-	h := block.Header.Height
-	if h == 0 || (h%100) != 0 {
+	var ln net.Listener
+	if addr != "" {
+		var err error
+		if ln, err = net.Listen("tcp", addr); err != nil {
+			return fmt.Errorf("explorer listen %s: %w", addr, err)
+		}
+	}
+	if d.explorerSrv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = d.explorerSrv.Shutdown(ctx)
+		cancel()
+		d.explorerSrv = nil
+	}
+	d.explorerAddr = addr
+	if addr == "" {
 		return nil
 	}
-	if h <= d.lastCheckpointWritten {
-		return nil
+	if d.explorer == nil {
+		d.explorer = NewExplorer(d)
 	}
-	if d.checkpointsFile == "" {
-		return nil
-	}
-	hash := block.Hash()
-	d.lastCheckpointWritten = h
-	return &checkpointEntry{
-		height: h,
-		line:   fmt.Sprintf("%d:%s\n", h, strings.ToUpper(hex.EncodeToString(hash[:]))),
-		file:   d.checkpointsFile,
-	}
-}
-
-func writeCheckpoint(entry *checkpointEntry) {
-	if entry == nil {
-		return
-	}
-	if err := os.MkdirAll(filepath.Dir(entry.file), 0o755); err != nil {
-		log.Printf("Warning: failed to create checkpoints dir: %v", err)
-		return
-	}
-	f, err := os.OpenFile(entry.file, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		log.Printf("Warning: failed to append checkpoint: %v", err)
-		return
-	}
-	defer f.Close()
-	if _, err := io.WriteString(f, entry.line); err != nil {
-		log.Printf("Warning: failed to write checkpoint: %v", err)
-	}
+	srv := d.explorer.httpServer(addr)
+	d.explorerSrv = srv
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("Explorer error: %v", err)
+		}
+	}()
+	return nil
 }
 
 // updateMempoolForAcceptedMainChain updates mempool contents for a newly
@@ -990,6 +1054,7 @@ func (d *Daemon) updateMempoolForAcceptedMainChain(block *Block, previousBest [3
 		d.mempool.OnBlockConnected(b)
 	}
 
+	d.mempool.RemoveUnspendableOnChain()
 	d.mempool.RemoveExpired()
 }
 
@@ -1099,31 +1164,31 @@ func (d *Daemon) txDataMapForBlock(block *Block) map[[32]byte][]byte {
 
 // getBlocksByHeight returns blocks in a height range for sync requests
 func (d *Daemon) getBlocksByHeight(startHeight uint64, max int) ([][]byte, error) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	var blocks [][]byte
-	for i := 0; i < max; i++ {
-		height := startHeight + uint64(i)
-		block := d.chain.GetBlockByHeight(height)
-		if block == nil {
-			break // Reached end of chain
-		}
-
-		blockData, err := json.Marshal(block)
-		if err != nil {
-			return nil, err
-		}
-		blocks = append(blocks, blockData)
+	stored, err := d.chain.Storage().GetMainChainBlocks(startHeight, max)
+	if err != nil {
+		return nil, err
 	}
+
+	blocks := make([][]byte, len(stored))
+	workers := min(len(stored), runtime.GOMAXPROCS(0)/2+1)
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := int(next.Add(1) - 1); i < len(stored); i = int(next.Add(1) - 1) {
+				blocks[i] = marshalBlockJSON(stored[i])
+			}
+		}()
+	}
+	wg.Wait()
 
 	return blocks, nil
 }
 
 // getMempoolTxs returns all serialized transactions in the mempool.
 func (d *Daemon) getMempoolTxs() [][]byte {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
 	return d.mempool.GetAllTransactionData()
 }
 
@@ -1145,33 +1210,38 @@ func (d *Daemon) processTxData(data []byte) error {
 
 // Stats returns daemon statistics
 type DaemonStats struct {
-	PeerID       string `json:"peer_id"`
-	Peers        int    `json:"peers"`
-	ChainHeight  uint64 `json:"chain_height"`
-	BestHash     string `json:"best_hash"`
-	TotalWork    uint64 `json:"total_work"`
-	MempoolSize  int    `json:"mempool_size"`
-	MempoolBytes int    `json:"mempool_bytes"`
-	Syncing      bool   `json:"syncing"`
-	SyncProgress uint64 `json:"sync_progress,omitempty"`
-	SyncTarget   uint64 `json:"sync_target,omitempty"`
-	SyncPercent  string `json:"sync_percent,omitempty"`
-	IdentityAge  string `json:"identity_age"`
+	PID               int    `json:"pid"`
+	PeerID            string `json:"peer_id"`
+	Peers             int    `json:"peers"`
+	ChainHeight       uint64 `json:"chain_height"`
+	BestHash          string `json:"best_hash"`
+	TotalWork         uint64 `json:"total_work"`
+	MempoolSize       int    `json:"mempool_size"`
+	MempoolBytes      int    `json:"mempool_bytes"`
+	MempoolGeneration uint64 `json:"mempool_generation"`
+	Syncing           bool   `json:"syncing"`
+	SyncProgress      uint64 `json:"sync_progress,omitempty"`
+	SyncTarget        uint64 `json:"sync_target,omitempty"`
+	SyncPercent       string `json:"sync_percent,omitempty"`
+	IdentityAge       string `json:"identity_age"`
 }
 
 func (d *Daemon) Stats() DaemonStats {
 	height, bestHash, totalWork := d.chain.TipFast()
+	mempoolStats := d.mempool.Stats()
 
 	stats := DaemonStats{
-		PeerID:       d.node.PeerID().String(),
-		Peers:        len(d.node.Peers()),
-		ChainHeight:  height,
-		BestHash:     fmt.Sprintf("%x", bestHash[:8]),
-		TotalWork:    totalWork,
-		MempoolSize:  d.mempool.Size(),
-		MempoolBytes: d.mempool.SizeBytes(),
-		Syncing:      d.syncMgr.IsSyncing(),
-		IdentityAge:  d.node.IdentityAge().Round(time.Second).String(),
+		PID:               os.Getpid(),
+		PeerID:            d.node.PeerID().String(),
+		Peers:             len(d.node.Peers()),
+		ChainHeight:       height,
+		BestHash:          fmt.Sprintf("%x", bestHash[:8]),
+		TotalWork:         totalWork,
+		MempoolSize:       mempoolStats.Count,
+		MempoolBytes:      mempoolStats.SizeBytes,
+		MempoolGeneration: mempoolStats.Generation,
+		Syncing:           d.syncMgr.IsSyncing(),
+		IdentityAge:       d.node.IdentityAge().Round(time.Second).String(),
 	}
 
 	// Add sync progress if syncing
@@ -1195,6 +1265,37 @@ func (d *Daemon) Node() *p2p.Node   { return d.node }
 func (d *Daemon) Miner() *Miner     { return d.miner }
 func (d *Daemon) TriggerSync()      { d.syncMgr.TriggerSync() }
 
+// templateTipChecked reports whether mining templates may be served yet. The
+// API comes up before the node has heard from any peer, and a template built
+// then may extend a tip the network has already passed: a block found on it is
+// accepted locally, announced, and orphaned once the node syncs. The gate
+// opens on the first comparison of the local tip with a peer's chain status,
+// or blockTemplatePeerTipWait after sync starts, and then stays open; later
+// sync lag is handled by IsSyncingFarBehind.
+func (d *Daemon) templateTipChecked() bool {
+	if d.tipGateOpen.Load() {
+		return true
+	}
+	checked := d.peerTipChecked
+	if checked == nil {
+		checked = d.syncMgr.PeerTipChecked
+	}
+	open := checked()
+	if !open {
+		if started := d.syncStartedAt.Load(); started != nil {
+			now := d.tipGateNow
+			if now == nil {
+				now = time.Now
+			}
+			open = now().Sub(*started) >= blockTemplatePeerTipWait
+		}
+	}
+	if open {
+		d.tipGateOpen.Store(true)
+	}
+	return open
+}
+
 // IsMining returns whether the miner is running
 func (d *Daemon) IsMining() bool {
 	return d.miner.IsRunning()
@@ -1213,6 +1314,15 @@ func (d *Daemon) MinerStats() MinerStats {
 // SubmitTransaction adds a transaction to mempool and broadcasts to peers.
 // SubmitBlock validates a mined block, adds it to the chain, and broadcasts to peers.
 func (d *Daemon) SubmitBlock(block *Block) error {
+	// Encode the announcement while the proof of work is checked, so peers get
+	// the block as soon as it is accepted.
+	marshaled := make(chan []byte, 1)
+	go func() { marshaled <- marshalBlockJSON(block) }()
+	// Verify with no lock held, and without waiting behind peers' blocks.
+	preverification, err := d.chain.PreverifyOwnBlock(block)
+	if err != nil {
+		return fmt.Errorf("failed to process block: %w", err)
+	}
 	d.mu.Lock()
 	if err := d.validateSubmitBlockStaleLocked(block); err != nil {
 		d.mu.Unlock()
@@ -1220,7 +1330,7 @@ func (d *Daemon) SubmitBlock(block *Block) error {
 	}
 
 	prevBest := d.chain.BestHash()
-	accepted, isMainChain, err := d.chain.ProcessBlock(block)
+	accepted, isMainChain, err := d.chain.ProcessPreverifiedBlock(block, preverification)
 	if err != nil {
 		d.mu.Unlock()
 		return fmt.Errorf("failed to process block: %w", err)
@@ -1230,27 +1340,24 @@ func (d *Daemon) SubmitBlock(block *Block) error {
 		return fmt.Errorf("block not accepted (duplicate or stale)")
 	}
 
-	var cp *checkpointEntry
+	// Broadcast to peers first: nothing below changes what they receive.
+	d.syncMgr.BroadcastBlock(<-marshaled)
+
 	if isMainChain {
 		d.updateMempoolForAcceptedMainChain(block, prevBest)
-		cp = d.prepareCheckpointLocked(block)
 		d.miner.NotifyNewBlock()
 	}
 	d.mu.Unlock()
 
-	writeCheckpoint(cp)
-
-	// Broadcast to peers
-	blockData, err := json.Marshal(block)
-	if err != nil {
-		return fmt.Errorf("failed to marshal block: %w", err)
+	// Notify wallet/UI subscribers only for blocks that became main-chain.
+	// Side-chain blocks may be accepted for fork choice, but scanning them would
+	// record outputs the wallet cannot spend on the canonical chain.
+	if isMainChain {
+		d.notifyBlock(block)
 	}
-	d.syncMgr.BroadcastBlock(blockData)
-
-	// Notify subscribers
-	d.notifyBlock(block)
 	d.notifyMinedBlock(block)
 
+	d.maybeSaveCheckpoints()
 	return nil
 }
 

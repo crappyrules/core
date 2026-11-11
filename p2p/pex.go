@@ -3,20 +3,23 @@ package p2p
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/big"
 	"net/netip"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"blocknet/protocol/params"
 
+	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	"github.com/multiformats/go-multiaddr"
 )
 
@@ -106,6 +109,18 @@ const (
 // MaxPeersPerExchange is the maximum peers to send in one exchange
 const MaxPeersPerExchange = 32
 
+const SeedConnectTarget = 2
+
+func cryptoShuffle[T any](s []T) {
+	for i := len(s) - 1; i > 0; i-- {
+		j, err := cryptoRandIntn(i + 1)
+		if err != nil {
+			return
+		}
+		s[i], s[j] = s[j], s[i]
+	}
+}
+
 const (
 	// MaxPeerRecordsPerResponse bounds inbound peer records per PEX exchange response.
 	MaxPeerRecordsPerResponse = MaxPeersPerExchange
@@ -113,6 +128,7 @@ const (
 	MaxPeerAddrsPerRecord = 16
 	// MaxKnownPeers bounds memory growth from peer churn.
 	MaxKnownPeers = 2048
+	KnownPeerTTL  = time.Hour
 )
 
 // PeerRecord represents a known peer's address info
@@ -121,20 +137,25 @@ type PeerRecord struct {
 	Addrs    []string `json:"addrs"`
 	LastSeen int64    `json:"last_seen"`
 	Score    int      `json:"score"` // Higher = better peer
+
+	lastContact int64
 }
 
 // Ban thresholds and durations
 const (
-	ScoreThresholdBan      = 0   // Score at or below triggers ban
-	ScoreThresholdWarn     = 20  // Score below this is concerning
-	ScorePenaltyInvalid    = -10 // Penalty for invalid data
-	ScorePenaltyTimeout    = -5  // Penalty for timeout
-	ScorePenaltyMisbehave  = -25 // Penalty for misbehavior
-	ScoreRewardGood        = 1   // Reward for good behavior
-	BanDurationShort       = 15 * time.Minute
-	BanDurationMedium      = 2 * time.Hour
-	BanDurationLong        = 24 * time.Hour
-	MaxBansBeforePermanent = 5 // After this many bans, permanent ban
+	peerStartingScore        = 50 // Every peer starts here
+	pexStreamTimeout         = 30 * time.Second
+	maxOutboundDialsPerRound = 4
+	ScoreThresholdBan        = 0   // Score at or below triggers ban
+	ScoreThresholdWarn       = 20  // Score below this is concerning
+	ScorePenaltyInvalid      = -10 // Penalty for invalid data
+	ScorePenaltyTimeout      = -5  // Penalty for timeout
+	ScorePenaltyMisbehave    = -25 // Penalty for misbehavior
+	ScoreRewardGood          = 1   // Reward for good behavior
+	BanDurationShort         = 15 * time.Minute
+	BanDurationMedium        = 2 * time.Hour
+	BanDurationLong          = 24 * time.Hour
+	MaxBansBeforePermanent   = 5 // After this many bans, permanent ban
 )
 
 const (
@@ -160,11 +181,12 @@ type BanRecord struct {
 
 // PeerExchange manages peer discovery without public DHT
 type PeerExchange struct {
-	mu sync.RWMutex
+	dialsInFlight atomic.Int32
+	mu            sync.RWMutex
 
-	node       *Node
-	seedNodes  []peer.AddrInfo
-	knownPeers map[peer.ID]*PeerRecord
+	node         *Node
+	seedNodes    []peer.AddrInfo
+	knownPeers   map[peer.ID]*PeerRecord
 	banWhitelist map[peer.ID]struct{}
 
 	// Ban list
@@ -172,6 +194,8 @@ type PeerExchange struct {
 
 	// Connection tracking
 	lastExchange map[peer.ID]time.Time
+	probedAt     map[peer.ID]time.Time
+	prober       host.Host
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -195,6 +219,22 @@ func newPeerIDSet(ids []string) (map[peer.ID]struct{}, error) {
 
 // NewPeerExchange creates a new peer exchange manager
 func NewPeerExchange(node *Node, seedAddrs []string, banWhitelist map[peer.ID]struct{}) *PeerExchange {
+	if banWhitelist == nil {
+		banWhitelist = make(map[peer.ID]struct{})
+	}
+
+	return &PeerExchange{
+		node:         node,
+		seedNodes:    parseSeedAddrs(seedAddrs),
+		knownPeers:   make(map[peer.ID]*PeerRecord),
+		banWhitelist: banWhitelist,
+		bannedPeers:  make(map[peer.ID]*BanRecord),
+		lastExchange: make(map[peer.ID]time.Time),
+		probedAt:     make(map[peer.ID]time.Time),
+	}
+}
+
+func parseSeedAddrs(seedAddrs []string) []peer.AddrInfo {
 	seeds := make([]peer.AddrInfo, 0, len(seedAddrs))
 	for _, addr := range seedAddrs {
 		ma, err := multiaddr.NewMultiaddr(addr)
@@ -207,18 +247,14 @@ func NewPeerExchange(node *Node, seedAddrs []string, banWhitelist map[peer.ID]st
 		}
 		seeds = append(seeds, *pi)
 	}
-	if banWhitelist == nil {
-		banWhitelist = make(map[peer.ID]struct{})
-	}
+	return seeds
+}
 
-	return &PeerExchange{
-		node:         node,
-		seedNodes:    seeds,
-		knownPeers:   make(map[peer.ID]*PeerRecord),
-		banWhitelist: banWhitelist,
-		bannedPeers:  make(map[peer.ID]*BanRecord),
-		lastExchange: make(map[peer.ID]time.Time),
-	}
+// setSeedNodes replaces the seed list. Only valid before Start.
+func (pex *PeerExchange) setSeedNodes(seedAddrs []string) {
+	pex.mu.Lock()
+	defer pex.mu.Unlock()
+	pex.seedNodes = parseSeedAddrs(seedAddrs)
 }
 
 func (pex *PeerExchange) isWhitelistedLocked(pid peer.ID) bool {
@@ -230,8 +266,15 @@ func (pex *PeerExchange) isWhitelistedLocked(pid peer.ID) bool {
 func (pex *PeerExchange) Start(ctx context.Context) error {
 	pex.ctx, pex.cancel = context.WithCancel(ctx)
 
+	if prober, err := newProbeHost(); err != nil {
+		log.Printf("PEX reachability checks disabled: %v", err)
+	} else {
+		pex.prober = prober
+	}
+
 	// Connect to seed nodes
 	if err := pex.connectToSeeds(); err != nil {
+		pex.closeProber()
 		return err
 	}
 
@@ -248,6 +291,22 @@ func (pex *PeerExchange) Stop() {
 	if pex.cancel != nil {
 		pex.cancel()
 	}
+	pex.closeProber()
+}
+
+func newProbeHost() (host.Host, error) {
+	return libp2p.New(
+		libp2p.NoListenAddrs,
+		libp2p.Transport(tcp.NewTCPTransport, tcp.DisableReuseport()),
+		libp2p.DisableRelay(),
+		libp2p.UserAgent("blocknet-probe"),
+	)
+}
+
+func (pex *PeerExchange) closeProber() {
+	if pex.prober != nil {
+		_ = pex.prober.Close()
+	}
 }
 
 // connectToSeeds attempts to connect to all seed nodes
@@ -257,13 +316,18 @@ func (pex *PeerExchange) connectToSeeds() error {
 	}
 
 	ourID := pex.node.PeerID()
+	seeds := append([]peer.AddrInfo(nil), pex.seedNodes...)
+	cryptoShuffle(seeds)
 	// Retry logic: try 3 times with 2 second delays
 	maxRetries := 3
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		var connected int
 		var skipped int
 
-		for _, seed := range pex.seedNodes {
+		for _, seed := range seeds {
+			if connected >= SeedConnectTarget {
+				break
+			}
 			// Don't connect to ourselves
 			if seed.ID == ourID {
 				skipped++
@@ -306,6 +370,7 @@ func (pex *PeerExchange) connectToSeeds() error {
 func (pex *PeerExchange) exchangeLoop() {
 	// Initial exchange after short delay
 	time.Sleep(5 * time.Second)
+	pex.checkConnectedPeers()
 
 	ticker := time.NewTicker(2 * time.Minute)
 	defer ticker.Stop()
@@ -332,20 +397,26 @@ func (pex *PeerExchange) doExchange() {
 	}
 
 	// Pick random peers to exchange with (max 3, crypto/rand)
-	for i := len(peers) - 1; i > 0; i-- {
-		jBig, _ := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
-		j := int(jBig.Int64())
-		peers[i], peers[j] = peers[j], peers[i]
-	}
+	cryptoShuffle(peers)
+
+	pex.checkConnectedPeers()
 
 	count := 3
 	if len(peers) < count {
 		count = len(peers)
 	}
 
+	// Concurrently, so one slow peer can't hold up discovery.
+	var wg sync.WaitGroup
 	for _, p := range peers[:count] {
-		pex.exchangeWith(p)
+		wg.Add(1)
+		go func(p peer.ID) {
+			defer wg.Done()
+			pex.exchangeWith(p)
+		}(p)
 	}
+	wg.Wait()
+	pex.refillOutbound()
 }
 
 // exchangeWith performs peer exchange with a specific peer
@@ -358,6 +429,10 @@ func (pex *PeerExchange) exchangeWith(p peer.ID) {
 		return
 	}
 	defer s.Close()
+	// The context above only bounds opening the stream.
+	if err := s.SetDeadline(time.Now().Add(pexStreamTimeout)); err != nil {
+		return
+	}
 
 	// Send GetPeers request
 	if err := writeMessage(s, PEXMsgGetPeers, nil); err != nil {
@@ -411,11 +486,6 @@ func (pex *PeerExchange) exchangeWith(p peer.ID) {
 
 		if len(addrs) > 0 {
 			pex.addKnownPeer(pid, addrs)
-
-			// Try to connect if we need more peers
-			if len(pex.node.Peers()) < pex.node.config.MaxOutbound {
-				go pex.tryConnect(pid, addrs)
-			}
 		}
 	}
 
@@ -599,9 +669,149 @@ func (pex *PeerExchange) tryConnect(pid peer.ID, addrs []multiaddr.Multiaddr) {
 	}
 }
 
+type knownPeerDial struct {
+	pid       peer.ID
+	addrs     []multiaddr.Multiaddr
+	contacted bool
+}
+
+// knownPeersToDial lists known peers we aren't connected to, in random order with
+// peers we have reached before ahead of addresses others told us about.
+func (pex *PeerExchange) knownPeersToDial() []knownPeerDial {
+	self := pex.node.PeerID()
+	pex.mu.RLock()
+	candidates := make([]knownPeerDial, 0, len(pex.knownPeers))
+	for pid, rec := range pex.knownPeers {
+		if pid == self || pex.node.host.Network().Connectedness(pid) == network.Connected {
+			continue
+		}
+		addrs := make([]multiaddr.Multiaddr, 0, len(rec.Addrs))
+		for _, a := range rec.Addrs {
+			if ma, err := multiaddr.NewMultiaddr(a); err == nil {
+				addrs = append(addrs, ma)
+			}
+		}
+		if len(addrs) > 0 {
+			candidates = append(candidates, knownPeerDial{pid: pid, addrs: addrs, contacted: rec.lastContact != 0})
+		}
+	}
+	pex.mu.RUnlock()
+
+	cryptoShuffle(candidates)
+	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].contacted && !candidates[j].contacted })
+	return candidates
+}
+
+// refillOutbound starts dials toward our outbound peer count, a few at a time.
+func (pex *PeerExchange) refillOutbound() {
+	need := pex.node.config.MaxOutbound - pex.node.outboundPeerCount() - int(pex.dialsInFlight.Load())
+	if need > 0 {
+		pex.dialKnownPeers(min(need, maxOutboundDialsPerRound))
+	}
+}
+
+// dialKnownPeers starts dials to up to count known peers that aren't banned.
+func (pex *PeerExchange) dialKnownPeers(count int) {
+	for _, c := range pex.knownPeersToDial() {
+		if count == 0 {
+			return
+		}
+		if pex.IsBanned(c.pid) {
+			continue
+		}
+		count--
+		pex.dialsInFlight.Add(1)
+		go func(c knownPeerDial) {
+			defer pex.dialsInFlight.Add(-1)
+			pex.tryConnect(c.pid, c.addrs)
+		}(c)
+	}
+}
+
+func (pex *PeerExchange) shouldProbe(pid peer.ID) bool {
+	pex.mu.Lock()
+	defer pex.mu.Unlock()
+
+	now := time.Now()
+	if last, ok := pex.probedAt[pid]; ok && now.Sub(last) < KnownPeerTTL/2 {
+		return false
+	}
+	if pex.probedAt == nil {
+		pex.probedAt = make(map[peer.ID]time.Time)
+	}
+	pex.probedAt[pid] = now
+	return true
+}
+
+func (pex *PeerExchange) checkConnectedPeers() {
+	for _, p := range pex.node.host.Network().Peers() {
+		if pex.shouldProbe(p) {
+			go pex.probePeer(p)
+		}
+	}
+}
+
+func (pex *PeerExchange) probePeer(pid peer.ID) {
+	if pex.prober == nil {
+		return
+	}
+	candidates := filterRoutableAddrs(pex.node.host.Peerstore().Addrs(pid))
+	if len(candidates) > MaxPeerAddrsPerRecord {
+		candidates = candidates[:MaxPeerAddrsPerRecord]
+	}
+	var reached []multiaddr.Multiaddr
+	for _, a := range candidates {
+		if _, err := a.ValueForProtocol(multiaddr.P_TCP); err != nil {
+			continue
+		}
+		if pex.dialBack(pid, a) {
+			reached = append(reached, a)
+		}
+	}
+	pex.markReachedAddrs(pid, reached)
+}
+
+func (pex *PeerExchange) dialBack(pid peer.ID, addr multiaddr.Multiaddr) bool {
+	ps := pex.prober.Peerstore()
+	ps.ClearAddrs(pid)
+	ctx, cancel := context.WithTimeout(pex.ctx, 5*time.Second)
+	err := pex.prober.Connect(ctx, peer.AddrInfo{ID: pid, Addrs: []multiaddr.Multiaddr{addr}})
+	cancel()
+	_ = pex.prober.Network().ClosePeer(pid)
+	ps.ClearAddrs(pid)
+	return err == nil
+}
+
+func (pex *PeerExchange) markReachedAddrs(pid peer.ID, addrs []multiaddr.Multiaddr) {
+	if len(addrs) == 0 {
+		return
+	}
+
+	pex.mu.Lock()
+	defer pex.mu.Unlock()
+
+	now := time.Now().Unix()
+	rec, ok := pex.knownPeers[pid]
+	if !ok {
+		rec = &PeerRecord{ID: pid.String(), Score: peerStartingScore}
+		pex.knownPeers[pid] = rec
+	}
+	rec.Addrs = make([]string, len(addrs))
+	for i, a := range addrs {
+		rec.Addrs[i] = a.String()
+	}
+	rec.LastSeen = now
+	rec.lastContact = now
+
+	pex.evictKnownPeersLocked(MaxKnownPeers)
+}
+
 // HandleStream handles incoming PEX protocol streams
 func (pex *PeerExchange) HandleStream(s network.Stream) {
 	defer s.Close()
+	if err := s.SetDeadline(time.Now().Add(pexStreamTimeout)); err != nil {
+		return
+	}
 
 	// Read message
 	msgType, _, err := readPEXMessage(s)
@@ -650,6 +860,7 @@ func (pex *PeerExchange) getPeerRecords(max int) []PeerRecord {
 	defer pex.mu.RUnlock()
 
 	records := make([]PeerRecord, 0, max)
+	cutoff := time.Now().Add(-KnownPeerTTL).Unix()
 
 	// Add connected peers first (they're definitely reachable)
 	for _, p := range pex.node.Peers() {
@@ -657,29 +868,24 @@ func (pex *PeerExchange) getPeerRecords(max int) []PeerRecord {
 			break
 		}
 
-		addrs := pex.node.host.Peerstore().Addrs(p)
-		addrs = filterRoutableAddrs(addrs)
-		if len(addrs) == 0 {
+		rec, ok := pex.knownPeers[p]
+		if !ok || rec.lastContact == 0 || rec.lastContact < cutoff {
 			continue
 		}
 
-		addrStrs := make([]string, len(addrs))
-		for i, a := range addrs {
-			addrStrs[i] = a.String()
-		}
-
-		records = append(records, PeerRecord{
-			ID:       p.String(),
-			Addrs:    addrStrs,
-			LastSeen: time.Now().Unix(),
-			Score:    10,
-		})
+		shared := *rec
+		shared.LastSeen = rec.lastContact
+		records = append(records, shared)
 	}
 
 	// Add from known peers
 	for pid, rec := range pex.knownPeers {
 		if len(records) >= max {
 			break
+		}
+
+		if rec.lastContact == 0 || rec.lastContact < cutoff {
+			continue
 		}
 
 		// Skip if already added
@@ -694,7 +900,9 @@ func (pex *PeerExchange) getPeerRecords(max int) []PeerRecord {
 			continue
 		}
 
-		records = append(records, *rec)
+		shared := *rec
+		shared.LastSeen = rec.lastContact
+		records = append(records, shared)
 	}
 
 	return records
@@ -716,14 +924,15 @@ func (pex *PeerExchange) addKnownPeer(pid peer.ID, addrs []multiaddr.Multiaddr) 
 	}
 
 	if existing, ok := pex.knownPeers[pid]; ok {
-		existing.Addrs = addrStrs
-		existing.LastSeen = time.Now().Unix()
+		if existing.lastContact == 0 {
+			existing.Addrs = addrStrs
+		}
 	} else {
 		pex.knownPeers[pid] = &PeerRecord{
 			ID:       pid.String(),
 			Addrs:    addrStrs,
 			LastSeen: time.Now().Unix(),
-			Score:    5,
+			Score:    peerStartingScore,
 		}
 	}
 
@@ -799,6 +1008,12 @@ func (pex *PeerExchange) updatePeerScore(pid peer.ID, delta int) {
 			pex.banPeerLocked(pid, "score dropped to zero", BanDurationMedium)
 		}
 	}
+}
+
+func (pex *PeerExchange) IsWhitelisted(pid peer.ID) bool {
+	pex.mu.RLock()
+	defer pex.mu.RUnlock()
+	return pex.isWhitelistedLocked(pid)
 }
 
 // IsBanned checks if a peer is currently banned
@@ -943,6 +1158,17 @@ func (pex *PeerExchange) UnbanPeer(pid peer.ID) {
 	delete(pex.bannedPeers, pid)
 }
 
+func (pex *PeerExchange) SetBanWhitelist(ids []string) error {
+	set, err := newPeerIDSet(ids)
+	if err != nil {
+		return err
+	}
+	pex.mu.Lock()
+	pex.banWhitelist = set
+	pex.mu.Unlock()
+	return nil
+}
+
 // GetBannedPeers returns list of currently banned peers
 func (pex *PeerExchange) GetBannedPeers() []*BanRecord {
 	pex.mu.RLock()
@@ -971,7 +1197,7 @@ func (pex *PeerExchange) PenalizePeer(pid peer.ID, penalty int, reason string) {
 		// Create record with starting score
 		rec = &PeerRecord{
 			ID:       pid.String(),
-			Score:    50, // Start at middle
+			Score:    peerStartingScore,
 			LastSeen: time.Now().Unix(),
 		}
 		pex.knownPeers[pid] = rec
@@ -989,14 +1215,48 @@ func (pex *PeerExchange) PenalizePeer(pid peer.ID, penalty int, reason string) {
 	}
 }
 
+// isSeed reports whether a peer is one of the configured seed nodes.
+func (pex *PeerExchange) isSeed(pid peer.ID) bool {
+	pex.mu.RLock()
+	defer pex.mu.RUnlock()
+	for _, seed := range pex.seedNodes {
+		if seed.ID == pid {
+			return true
+		}
+	}
+	return false
+}
+
+// isTrustedBlockSource reports whether a peer is a seed, whitelisted, or has
+// earned a score above what every peer starts with.
+func (pex *PeerExchange) isTrustedBlockSource(pid peer.ID) bool {
+	pex.mu.RLock()
+	defer pex.mu.RUnlock()
+	if pex.isWhitelistedLocked(pid) {
+		return true
+	}
+	for _, seed := range pex.seedNodes {
+		if seed.ID == pid {
+			return true
+		}
+	}
+	rec, ok := pex.knownPeers[pid]
+	return ok && rec.Score > peerStartingScore
+}
+
 // RewardPeer increases a peer's score for good behavior
 func (pex *PeerExchange) RewardPeer(pid peer.ID) {
+	pex.mu.Lock()
+	if _, ok := pex.knownPeers[pid]; !ok {
+		pex.knownPeers[pid] = &PeerRecord{ID: pid.String(), Score: peerStartingScore, LastSeen: time.Now().Unix()}
+	}
+	pex.mu.Unlock()
 	pex.updatePeerScore(pid, ScoreRewardGood)
 }
 
 // cleanupLoop removes stale peers
 func (pex *PeerExchange) cleanupLoop() {
-	ticker := time.NewTicker(30 * time.Minute)
+	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
 
 	for {
@@ -1019,12 +1279,14 @@ func (pex *PeerExchange) reconnectLoop() {
 		case <-pex.ctx.Done():
 			return
 		case <-ticker.C:
-			peers := pex.node.host.Network().Peers()
-			if len(peers) == 0 {
+			// Count only peers we dialed: inbound connections can all be one attacker.
+			outbound := pex.node.outboundPeerCount()
+			if outbound == 0 {
 				if err := pex.connectToSeeds(); err != nil {
 					log.Printf("PEX reconnect loop seed dial failed: %v", err)
 				}
 			}
+			pex.refillOutbound()
 		}
 	}
 }
@@ -1035,12 +1297,21 @@ func (pex *PeerExchange) cleanup() {
 	defer pex.mu.Unlock()
 
 	now := time.Now()
-	cutoff := now.Add(-24 * time.Hour).Unix()
+	cutoff := now.Add(-KnownPeerTTL).Unix()
 
 	// Cleanup stale peers
 	for pid, rec := range pex.knownPeers {
-		if rec.LastSeen < cutoff {
-			delete(pex.knownPeers, pid)
+		if rec.LastSeen >= cutoff {
+			continue
+		}
+		if pex.node != nil && pex.node.host != nil && pex.node.host.Network().Connectedness(pid) == network.Connected {
+			continue
+		}
+		delete(pex.knownPeers, pid)
+	}
+	for pid, at := range pex.probedAt {
+		if now.Sub(at) > KnownPeerTTL {
+			delete(pex.probedAt, pid)
 		}
 	}
 

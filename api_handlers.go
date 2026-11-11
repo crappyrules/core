@@ -24,6 +24,18 @@ import (
 const (
 	sendMinFee     = uint64(1000) // 0.00001 BNT minimum fee
 	sendFeePerByte = uint64(10)   // 0.0000001 BNT per byte
+
+	// blockTemplateSyncHeightTolerance is how many blocks behind an active
+	// sync target the local tip may be while still serving mining templates.
+	// Near-tip sync runs (propagation races, overlap re-downloads) finish in
+	// seconds and do not make templates meaningfully stale; hard-failing them
+	// starves pools of work for the whole run.
+	blockTemplateSyncHeightTolerance = uint64(2)
+
+	// blockTemplatePeerTipWait caps how long after sync starts the template
+	// endpoint waits for the first comparison of the local tip with a peer's
+	// chain status, so isolated, testnet and no-peer nodes still get work.
+	blockTemplatePeerTipWait = 15 * time.Second
 )
 
 // ============================================================================
@@ -34,9 +46,20 @@ const (
 func (s *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	resp := struct {
 		DaemonStats
-		Wallet *wallet.WalletDiagnostics `json:"wallet,omitempty"`
+		PeerAddrs      []string                  `json:"peer_addrs"`
+		NetworkUpgrade networkUpgradeInfo        `json:"network_upgrade"`
+		UpdateNotice   string                    `json:"update_notice,omitempty"`
+		Wallet         *wallet.WalletDiagnostics `json:"wallet,omitempty"`
 	}{
-		DaemonStats: s.daemon.Stats(),
+		DaemonStats:    s.daemon.Stats(),
+		PeerAddrs:      []string{},
+		NetworkUpgrade: currentNetworkUpgrade(),
+	}
+	if chain := s.daemon.Chain(); chain != nil {
+		resp.UpdateNotice = updateNotice(chain.Height())
+	}
+	if node := s.daemon.Node(); node != nil {
+		resp.PeerAddrs = node.FullMultiaddrs()
 	}
 	if s.wallet != nil && !s.locked {
 		diag := s.wallet.Diagnostics()
@@ -59,7 +82,7 @@ func (s *APIServer) handleBlock(w http.ResponseWriter, r *http.Request) {
 
 	// Try as height first
 	if height, err := strconv.ParseUint(id, 10, 64); err == nil {
-		block = chain.GetBlockByHeight(height)
+		block = chain.GetBlockByHeightFast(height)
 	} else if len(id) == 64 {
 		// Try as hex hash
 		hashBytes, err := hex.DecodeString(id)
@@ -69,7 +92,7 @@ func (s *APIServer) handleBlock(w http.ResponseWriter, r *http.Request) {
 		}
 		var hash [32]byte
 		copy(hash[:], hashBytes)
-		block = chain.GetBlock(hash)
+		block = chain.GetBlockFast(hash)
 	} else {
 		writeError(w, http.StatusBadRequest, "id must be a height or 64-char hex hash")
 		return
@@ -151,6 +174,7 @@ func (s *APIServer) handlePeers(w http.ResponseWriter, r *http.Request) {
 	type peerEntry struct {
 		PeerID string   `json:"peer_id"`
 		Addrs  []string `json:"addrs"`
+		Agent  string   `json:"agent,omitempty"`
 	}
 
 	entries := make([]peerEntry, len(infos))
@@ -158,6 +182,7 @@ func (s *APIServer) handlePeers(w http.ResponseWriter, r *http.Request) {
 		entries[i] = peerEntry{
 			PeerID: info.ID.String(),
 			Addrs:  info.Addrs,
+			Agent:  info.Agent,
 		}
 		if entries[i].Addrs == nil {
 			entries[i].Addrs = []string{}
@@ -263,6 +288,202 @@ func (s *APIServer) handleVerify(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"valid": true})
 }
 
+// statsHashrateSamples is the number of recent block intervals sampled when
+// estimating network hashrate and average block time for GET /api/stats.
+const statsHashrateSamples = 12
+
+// handleStats returns network and emission/economics statistics as numeric
+// JSON, with all amounts in smallest units. No wallet is required; the values
+// are a deterministic function of the chain tip.
+// GET /api/stats
+func (s *APIServer) handleStats(w http.ResponseWriter, r *http.Request) {
+	chain := s.daemon.Chain()
+	tip := chain.BestHash()
+
+	// The response depends only on the chain tip, so serve a memoized copy
+	// while the tip is unchanged and recompute only when a block/reorg lands.
+	s.statsMu.Lock()
+	if s.statsValid && s.statsTip == tip {
+		cached := s.statsCache
+		s.statsMu.Unlock()
+		writeJSON(w, http.StatusOK, cached)
+		return
+	}
+	s.statsMu.Unlock()
+
+	// Lock-free reads: this runs on a request, and c.mu is held for the whole
+	// of block validation. A stats page has no reason to wait on that.
+	height := chain.HeightFast()
+	emitted, remaining, pctEmitted := SupplyBreakdown(height)
+	hashrate, avgBlockTime := chain.RecentBlockStats(statsHashrateSamples)
+
+	resp := map[string]any{
+		"height":             height,
+		"difficulty":         chain.NextDifficultyFast(),
+		"network_hashrate":   hashrate,     // hashes/sec, recent sample
+		"avg_block_time":     avgBlockTime, // seconds, recent sample
+		"block_reward":       GetBlockReward(height),
+		"emitted":            emitted,
+		"remaining":          remaining,
+		"target_supply":      uint64(TargetSupply),
+		"pct_emitted":        pctEmitted,
+		"tail_emission":      uint64(TailEmission),
+		"months_to_tail":     int(MonthsToTail),
+		"blocks_per_month":   uint64(BlocksPerMonth),
+		"block_interval_sec": int(BlockIntervalSec),
+	}
+
+	s.statsMu.Lock()
+	s.statsCache = resp
+	s.statsTip = tip
+	s.statsValid = true
+	s.statsMu.Unlock()
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// findTxForProof locates a transaction by hex id, checking the chain then the
+// mempool. blockHeight is 0 for mempool txs (which are never coinbase).
+func (s *APIServer) findTxForProof(txHash string) (tx *Transaction, blockHeight uint64, isCoinbase bool, found bool) {
+	tx, blockHeight, found = s.daemon.Chain().FindTxByHashStr(txHash)
+	if !found {
+		hashBytes, err := hex.DecodeString(txHash)
+		if err == nil && len(hashBytes) == 32 {
+			var txID [32]byte
+			copy(txID[:], hashBytes)
+			tx, found = s.daemon.Mempool().GetTransaction(txID)
+		}
+	}
+	if !found {
+		return nil, 0, false, false
+	}
+	return tx, blockHeight, len(tx.Inputs) == 0, true
+}
+
+// handleVerifyProof verifies a sender's payment proof. Given a txid, the
+// deterministic tx private key (tx_key from POST /api/wallet/prove), and a
+// recipient address, it confirms the tx_key genuinely belongs to the
+// transaction and reveals which of its outputs that address received, with
+// amounts (smallest units) and any memo. Stateless — no wallet required.
+// POST /api/verify-proof
+func (s *APIServer) handleVerifyProof(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	if !s.proofLimiter.allow(ip) {
+		writeError(w, http.StatusTooManyRequests, "verify-proof rate limit exceeded")
+		return
+	}
+
+	var req struct {
+		TxID    string `json:"txid"`
+		TxKey   string `json:"tx_key"`
+		Address string `json:"address"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if len(req.TxID) != 64 {
+		writeError(w, http.StatusBadRequest, "txid must be 64 hex characters")
+		return
+	}
+	if _, err := hex.DecodeString(req.TxID); err != nil {
+		writeError(w, http.StatusBadRequest, "txid must be 64 hex characters")
+		return
+	}
+	if len(req.TxKey) != 64 {
+		writeError(w, http.StatusBadRequest, "tx_key must be 64 hex characters")
+		return
+	}
+	if req.Address == "" {
+		writeError(w, http.StatusBadRequest, "address is required")
+		return
+	}
+
+	txKeyBytes, err := hex.DecodeString(req.TxKey)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid tx_key hex")
+		return
+	}
+	var txPriv [32]byte
+	copy(txPriv[:], txKeyBytes)
+
+	spendPub, viewPub, err := parseValidatedAddress(req.Address)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid address")
+		return
+	}
+
+	tx, blockHeight, isCoinbase, found := s.findTxForProof(req.TxID)
+	if !found {
+		writeError(w, http.StatusNotFound, "transaction not found")
+		return
+	}
+
+	// The proof holds only if the prover knows r such that r*G equals the
+	// transaction's on-chain public key. A well-formed but non-matching tx_key
+	// is a legitimate "invalid proof" result (200), mirroring POST /api/verify.
+	derivedPub, err := ScalarToPubKey(txPriv)
+	if err != nil || derivedPub != tx.TxPublicKey {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"txid":          req.TxID,
+			"valid":         false,
+			"total_matched": uint64(0),
+			"outputs":       []any{},
+		})
+		return
+	}
+
+	// ECDH is symmetric: H(tx_priv * view_pub) == H(view_priv * tx_pub), so the
+	// recipient's outputs can be identified from the sender side.
+	outputs, totalMatched := matchProofOutputs(tx, txPriv, spendPub, viewPub, isCoinbase, blockHeight)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"txid":          req.TxID,
+		"valid":         true,
+		"total_matched": totalMatched,
+		"outputs":       outputs,
+	})
+}
+
+// matchProofOutputs reports, for each output of tx, whether the recipient
+// (spendPub/viewPub) received it and — for matches — the amount (atomic units)
+// and any memo, using the sender's tx private key. It mirrors the explorer
+// prove-send crypto and is factored out so the match logic is unit-testable
+// without a live chain lookup.
+func matchProofOutputs(tx *Transaction, txPriv, spendPub, viewPub [32]byte, isCoinbase bool, blockHeight uint64) (outputs []map[string]any, totalMatched uint64) {
+	outputs = make([]map[string]any, 0, len(tx.Outputs))
+	for i, out := range tx.Outputs {
+		if !CheckStealthOutput(spendPub, txPriv, viewPub, out.PublicKey) {
+			outputs = append(outputs, map[string]any{"index": i, "match": false})
+			continue
+		}
+
+		var blinding [32]byte
+		var memo string
+		if isCoinbase {
+			blinding = wallet.DeriveCoinbaseConsensusBlinding(tx.TxPublicKey, blockHeight, i)
+		} else {
+			secret, serr := DeriveStealthSecretSender(txPriv, viewPub)
+			if serr == nil {
+				blinding = wallet.DeriveBlinding(secret, i)
+				if m, ok := wallet.DecryptMemo(out.EncryptedMemo, secret, i); ok && len(m) > 0 {
+					memo = string(m)
+				}
+			}
+		}
+
+		amount := wallet.DecryptAmount(out.EncryptedAmount, blinding, i)
+		totalMatched += amount
+
+		entry := map[string]any{"index": i, "match": true, "amount": amount}
+		if memo != "" {
+			entry["memo"] = memo
+		}
+		outputs = append(outputs, entry)
+	}
+	return outputs, totalMatched
+}
+
 // ============================================================================
 // Wallet handlers (require loaded + unlocked wallet)
 // ============================================================================
@@ -341,6 +562,7 @@ func (s *APIServer) handleHistory(w http.ResponseWriter, r *http.Request) {
 		IsCoinbase  bool   `json:"is_coinbase"`
 		Spent       bool   `json:"spent"`
 		SpentHeight uint64 `json:"spent_height,omitempty"`
+		Unspendable bool   `json:"unspendable,omitempty"`
 		MemoHex     string `json:"memo_hex,omitempty"`
 	}
 
@@ -354,6 +576,7 @@ func (s *APIServer) handleHistory(w http.ResponseWriter, r *http.Request) {
 			IsCoinbase:  out.IsCoinbase,
 			Spent:       out.Spent,
 			SpentHeight: out.SpentHeight,
+			Unspendable: out.Unspendable,
 		}
 		if len(out.Memo) > 0 {
 			entries[i].MemoHex = hex.EncodeToString(out.Memo)
@@ -362,6 +585,120 @@ func (s *APIServer) handleHistory(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"count":   len(entries),
+		"outputs": entries,
+	})
+}
+
+// GET /api/wallet/history/page
+// Paginated view of the same wallet outputs as handleHistory. Busy wallets can
+// hold thousands of outputs; this lets a client fetch them newest-first in
+// fixed-size pages instead of shipping the entire set at once. The unpaginated
+// /api/wallet/history endpoint is left untouched for backward compatibility.
+func (s *APIServer) handleHistoryPage(w http.ResponseWriter, r *http.Request) {
+	if !s.requireWallet(w, r) {
+		return
+	}
+
+	limit, err := parseWalletSendsIntQuery(r, "limit", 20, 0, 500)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	offset, err := parseWalletSendsIntQuery(r, "offset", 0, 0, 0)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	order := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("order")))
+	if order == "" {
+		order = "desc"
+	}
+	if order != "desc" && order != "asc" {
+		writeError(w, http.StatusBadRequest, "order must be asc or desc")
+		return
+	}
+
+	type outputEntry struct {
+		TxID        string `json:"txid"`
+		OutputIndex int    `json:"output_index"`
+		Amount      uint64 `json:"amount"`
+		BlockHeight uint64 `json:"block_height"`
+		IsCoinbase  bool   `json:"is_coinbase"`
+		Spent       bool   `json:"spent"`
+		SpentHeight uint64 `json:"spent_height,omitempty"`
+		Unspendable bool   `json:"unspendable,omitempty"`
+		MemoHex     string `json:"memo_hex,omitempty"`
+	}
+
+	outputs := s.wallet.AllOutputs()
+
+	// Precompute hex txids once so the comparator stays cheap.
+	txidHex := make(map[*wallet.OwnedOutput]string, len(outputs))
+	for _, out := range outputs {
+		txidHex[out] = fmt.Sprintf("%x", out.TxID)
+	}
+
+	// Canonical newest-first total order over (txid, output_index) unique keys:
+	// unconfirmed (block_height 0) first, then descending block height, with
+	// txid then output index as tie-breakers. Because (txid, output_index) is
+	// unique this is a strict total order, so a page never overlaps or skips an
+	// output. order=asc is the exact reverse of this order (matching the sibling
+	// /api/wallet/sends endpoint), not just a re-sort of the primary key.
+	descLess := func(a, b *wallet.OwnedOutput) bool {
+		aPending := a.BlockHeight == 0
+		bPending := b.BlockHeight == 0
+		if aPending != bPending {
+			return aPending
+		}
+		if a.BlockHeight != b.BlockHeight {
+			return a.BlockHeight > b.BlockHeight
+		}
+		if txidHex[a] != txidHex[b] {
+			return txidHex[a] < txidHex[b]
+		}
+		return a.OutputIndex < b.OutputIndex
+	}
+	sort.SliceStable(outputs, func(i, j int) bool {
+		if order == "asc" {
+			return descLess(outputs[j], outputs[i])
+		}
+		return descLess(outputs[i], outputs[j])
+	})
+
+	total := len(outputs)
+	start := offset
+	if start > total {
+		start = total
+	}
+	end := start + limit
+	if end > total {
+		end = total
+	}
+	page := outputs[start:end]
+
+	entries := make([]outputEntry, len(page))
+	for i, out := range page {
+		entries[i] = outputEntry{
+			TxID:        txidHex[out],
+			OutputIndex: out.OutputIndex,
+			Amount:      out.Amount,
+			BlockHeight: out.BlockHeight,
+			IsCoinbase:  out.IsCoinbase,
+			Spent:       out.Spent,
+			SpentHeight: out.SpentHeight,
+			Unspendable: out.Unspendable,
+		}
+		if len(out.Memo) > 0 {
+			entries[i].MemoHex = hex.EncodeToString(out.Memo)
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"count":   len(entries),
+		"total":   total,
+		"limit":   limit,
+		"offset":  offset,
+		"order":   order,
 		"outputs": entries,
 	})
 }
@@ -479,7 +816,11 @@ func (s *APIServer) handleSends(w http.ResponseWriter, r *http.Request) {
 	for _, view := range pageViews {
 		pageTxIDs = append(pageTxIDs, view.record.TxID)
 	}
-	txStates := s.walletSendChainStates(pageTxIDs, chainHeight)
+	txStates, err := s.walletSendChainStates(pageTxIDs, chainHeight)
+	if err != nil {
+		writeInternal(w, r, http.StatusInternalServerError, "unable to read transaction status", err)
+		return
+	}
 
 	sends := make([]sendEntry, 0, end-start)
 	for _, view := range pageViews {
@@ -557,13 +898,15 @@ func (s *APIServer) handleOutputs(w http.ResponseWriter, r *http.Request) {
 		MemoHex       string `json:"memo_hex,omitempty"`
 	}
 
-	var spentCount, unspentCount, pendingCount int
+	var spentCount, unspentCount, pendingCount, unspendableCount int
 
 	entries := make([]outputEntry, len(outputs))
 	for i, out := range outputs {
 		status := "unspent"
 		if out.Spent {
 			status = "spent"
+		} else if out.Unspendable {
+			status = "unspendable"
 		} else if !wallet.IsOutputMature(out, chainHeight) {
 			status = "pending"
 		}
@@ -575,6 +918,8 @@ func (s *APIServer) handleOutputs(w http.ResponseWriter, r *http.Request) {
 			unspentCount++
 		case "pending":
 			pendingCount++
+		case "unspendable":
+			unspendableCount++
 		}
 
 		conf := uint64(0)
@@ -611,6 +956,7 @@ func (s *APIServer) handleOutputs(w http.ResponseWriter, r *http.Request) {
 		"spent":         spentCount,
 		"unspent":       unspentCount,
 		"pending":       pendingCount,
+		"unspendable":   unspendableCount,
 		"outputs":       entries,
 	})
 }
@@ -880,6 +1226,9 @@ func (s *APIServer) handleSend(w http.ResponseWriter, r *http.Request) {
 		case "inflight":
 			writeError(w, http.StatusConflict, "idempotency key in progress")
 			return
+		case "interrupted":
+			writeError(w, http.StatusConflict, idempotencyInterruptedMessage)
+			return
 		case "start":
 			// proceed (complete on return)
 		default:
@@ -934,7 +1283,14 @@ func (s *APIServer) handleSend(w http.ResponseWriter, r *http.Request) {
 	height := s.daemon.Chain().Height()
 	spendable := s.wallet.SpendableBalance(height)
 	if spendable < totalSend {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("insufficient spendable balance: have %d, need %d", spendable, totalSend))
+		pending := s.wallet.PendingBalance(height)
+		if pending > 0 {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("insufficient spendable balance: have %s spendable + %s pending (confirming), need %s",
+				formatAmount(spendable), formatAmount(pending), formatAmount(totalSend)))
+		} else {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("insufficient spendable balance: have %s, need %s",
+				formatAmount(spendable), formatAmount(totalSend)))
+		}
 		return
 	}
 
@@ -1078,6 +1434,9 @@ func (s *APIServer) handleSendAdvanced(w http.ResponseWriter, r *http.Request) {
 		case "inflight":
 			writeError(w, http.StatusConflict, "idempotency key in progress")
 			return
+		case "interrupted":
+			writeError(w, http.StatusConflict, idempotencyInterruptedMessage)
+			return
 		case "start":
 		default:
 			writeError(w, http.StatusInternalServerError, "idempotency state error")
@@ -1199,8 +1558,8 @@ func (s *APIServer) handleSendAdvanced(w http.ResponseWriter, r *http.Request) {
 		need, ok := wallet.AddU64(totalSend, fee)
 		if !ok || inputTotal < need {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf(
-				"insufficient input amount: inputs total %d, need at least %d (amount %d + fee %d)",
-				inputTotal, totalSend+fee, totalSend, fee))
+				"insufficient input amount: inputs total %s, need at least %s (amount %s + fee %s)",
+				formatAmount(inputTotal), formatAmount(totalSend+fee), formatAmount(totalSend), formatAmount(fee)))
 			return
 		}
 
@@ -1209,7 +1568,7 @@ func (s *APIServer) handleSendAdvanced(w http.ResponseWriter, r *http.Request) {
 			"dry_run":      true,
 			"fee":          fee,
 			"change":       change,
-			"change_split": changeSplit,
+			"change_split": int(min(uint64(changeSplit), change)),
 			"input_total":  inputTotal,
 			"input_count":  len(inputs),
 			"recipients":   buildRecipientResults(validated),
@@ -1253,7 +1612,7 @@ func (s *APIServer) handleSendAdvanced(w http.ResponseWriter, r *http.Request) {
 		"txid":         fmt.Sprintf("%x", result.TxID),
 		"fee":          result.Fee,
 		"change":       result.Change,
-		"change_split": changeSplit,
+		"change_split": result.ChangeOutputs,
 		"input_total":  inputTotal,
 		"input_count":  len(inputs),
 		"dry_run":      false,
@@ -1313,6 +1672,7 @@ func (s *APIServer) handleUnloadWallet(w http.ResponseWriter, r *http.Request) {
 	s.cli.passwordHash = [32]byte{}
 	s.cli.passwordHashSet = false
 	s.cli.mu.Unlock()
+	s.cli.waitForWalletScans()
 
 	writeJSON(w, http.StatusOK, map[string]any{"unloaded": true})
 }
@@ -1438,19 +1798,21 @@ func (s *APIServer) handleLoadWallet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	walletPath := s.cli.walletFile
+	walletPath := s.cli.walletFilePath()
 	if req.Filepath != "" {
 		base := filepath.Base(req.Filepath)
 		if base == "." || base == "/" {
 			writeError(w, http.StatusBadRequest, "invalid filepath")
 			return
 		}
-		walletPath = filepath.Join(filepath.Dir(s.cli.walletFile), base)
+		walletPath = filepath.Join(filepath.Dir(s.cli.walletFilePath()), base)
 	}
 
+	loadStartedAt := time.Now()
 	password := []byte(req.Password)
 	passHash := passwordHash(password)
 	wl, err := wallet.LoadWallet(walletPath, password, defaultWalletConfig())
+	decodedAt := time.Now()
 	wipeBytes(password)
 	if err != nil {
 		if status, msg, ok := walletLoadClientError(err); ok {
@@ -1468,24 +1830,44 @@ func (s *APIServer) handleLoadWallet(w http.ResponseWriter, r *http.Request) {
 
 	// Handle chain-ahead-of-wallet (chain was reset while wallet was offline)
 	chainHeight := s.daemon.Chain().Height()
-	walletHeight := wl.SyncedHeight()
-	if walletHeight > chainHeight {
-		if removed := wl.RewindToHeight(chainHeight); removed > 0 {
+	originalWalletHeight := wl.SyncedHeight()
+	if removed := rewindWalletToCanonicalTip(wl, s.daemon.Chain()); removed > 0 {
+		if err := wl.Save(); err != nil {
+			writeInternal(w, r, http.StatusInternalServerError, "internal error", err)
+			return
+		}
+	}
+
+	rewoundAt := time.Now()
+	walletHeight, walletHash := wl.SyncedBlock()
+	if originalWalletHeight == chainHeight && walletHeight == chainHeight && chainHeight > 0 && !walletSyncHashKnown(walletHash) {
+		// Legacy wallets do not know which block hash they scanned at the tip.
+		// Rewind one block so the next scan records canonical hash metadata.
+		if removed := wl.RewindToHeight(chainHeight - 1); removed > 0 {
 			if err := wl.Save(); err != nil {
 				writeInternal(w, r, http.StatusInternalServerError, "internal error", err)
 				return
 			}
 		}
-		walletHeight = wl.SyncedHeight()
 	}
 
-	// Conservative reorg recovery: when wallet and chain heights match exactly,
-	// rewind one block and rescan tip. This clears stale same-height branch data
-	// even for wallets that predate tip-hash sync metadata.
-	if walletHeight == chainHeight && chainHeight > 0 {
-		wl.RewindToHeight(chainHeight - 1)
-		walletHeight = wl.SyncedHeight()
+	auditStartedAt := time.Now()
+	if issues := repairableWalletOutputIssues(auditWalletCanonicalOutputs(s.daemon.Chain(), wl.AllOutputs()), false); len(issues) > 0 {
+		removed := removeWalletOutputIssues(wl, issues)
+		if len(removed) > 0 {
+			log.Printf("Wallet load: removed %d noncanonical wallet output(s) totaling %d atomic units", len(removed), sumOwnedOutputs(removed))
+			if err := wl.Save(); err != nil {
+				writeInternal(w, r, http.StatusInternalServerError, "internal error", err)
+				return
+			}
+		}
 	}
+
+	auditedAt := time.Now()
+	log.Printf("[perf] wallet load outputs=%d decode=%s rewind=%s audit=%s total=%s",
+		len(wl.AllOutputs()), decodedAt.Sub(loadStartedAt).Round(time.Millisecond),
+		rewoundAt.Sub(decodedAt).Round(time.Millisecond), auditedAt.Sub(auditStartedAt).Round(time.Millisecond),
+		auditedAt.Sub(loadStartedAt).Round(time.Millisecond))
 
 	wl.SetInputFilter(func(out *wallet.OwnedOutput) bool {
 		ki, err := GenerateKeyImage(out.OneTimePrivKey)
@@ -1559,14 +1941,14 @@ func (s *APIServer) handleCreateWallet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	walletPath := s.cli.walletFile
+	walletPath := s.cli.walletFilePath()
 	if req.Filename != "" {
 		base := filepath.Base(req.Filename)
 		if base == "." || base == "/" {
 			writeError(w, http.StatusBadRequest, "invalid filename")
 			return
 		}
-		walletPath = filepath.Join(filepath.Dir(s.cli.walletFile), base)
+		walletPath = filepath.Join(filepath.Dir(s.cli.walletFilePath()), base)
 	}
 
 	if _, err := os.Stat(walletPath); err == nil {
@@ -1589,7 +1971,11 @@ func (s *APIServer) handleCreateWallet(w http.ResponseWriter, r *http.Request) {
 
 	chainHeight := s.daemon.Chain().Height()
 	if chainHeight > 0 {
-		wl.SetSyncedHeight(chainHeight)
+		if block := s.daemon.Chain().GetBlockByHeight(chainHeight); block != nil {
+			wl.SetSyncedBlock(chainHeight, block.Hash())
+		} else {
+			wl.SetSyncedHeight(chainHeight)
+		}
 		if err := wl.Save(); err != nil {
 			writeInternal(w, r, http.StatusInternalServerError, "internal error", err)
 			return
@@ -1656,36 +2042,36 @@ func (s *APIServer) handleImportWallet(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	var req struct {
-		Mnemonic string `json:"mnemonic"`
-		Password string `json:"password"`
-		Filename string `json:"filename"`
+		Mnemonic  string `json:"mnemonic"`
+		SpendPriv string `json:"spend_priv"`
+		ViewPriv  string `json:"view_priv"`
+		SpendPub  string `json:"spend_pub"`
+		Password  string `json:"password"`
+		Filename  string `json:"filename"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if req.Mnemonic == "" {
-		writeError(w, http.StatusBadRequest, "mnemonic is required")
+	create, err := importWalletBuilder(req.Mnemonic, req.SpendPriv, req.ViewPriv, req.SpendPub)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if len(req.Password) < 3 {
 		writeError(w, http.StatusBadRequest, "password must be at least 3 characters")
 		return
 	}
-	if !wallet.ValidateMnemonic(req.Mnemonic) {
-		writeError(w, http.StatusBadRequest, "invalid mnemonic phrase")
-		return
-	}
 
 	// Resolve wallet path: basename only, same directory as configured --wallet path
-	walletPath := s.cli.walletFile
+	walletPath := s.cli.walletFilePath()
 	if req.Filename != "" {
 		base := filepath.Base(req.Filename)
 		if base == "." || base == "/" {
 			writeError(w, http.StatusBadRequest, "invalid filename")
 			return
 		}
-		walletPath = filepath.Join(filepath.Dir(s.cli.walletFile), base)
+		walletPath = filepath.Join(filepath.Dir(s.cli.walletFilePath()), base)
 	}
 
 	// Don't overwrite an existing file
@@ -1696,7 +2082,7 @@ func (s *APIServer) handleImportWallet(w http.ResponseWriter, r *http.Request) {
 
 	password := []byte(req.Password)
 	passHash := passwordHash(password)
-	wl, err := wallet.NewWalletFromMnemonic(walletPath, password, req.Mnemonic, defaultWalletConfig())
+	wl, err := create(walletPath, password)
 	wipeBytes(password)
 	if err != nil {
 		writeInternal(w, r, http.StatusInternalServerError, "internal error", err)
@@ -1741,11 +2127,82 @@ func (s *APIServer) handleImportWallet(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"imported":      true,
+		"view_only":     wl.IsViewOnly(),
 		"address":       wl.Address(),
 		"filename":      filepath.Base(walletPath),
 		"synced_height": wl.SyncedHeight(),
 		"chain_height":  chainHeight,
 	})
+}
+
+type walletBuilder func(path string, password []byte) (*wallet.Wallet, error)
+
+func importWalletBuilder(mnemonic, spendPrivHex, viewPrivHex, spendPubHex string) (walletBuilder, error) {
+	mnemonic = strings.TrimSpace(mnemonic)
+	spendPrivHex = strings.TrimSpace(spendPrivHex)
+	viewPrivHex = strings.TrimSpace(viewPrivHex)
+	spendPubHex = strings.TrimSpace(spendPubHex)
+
+	switch {
+	case mnemonic != "" && spendPrivHex == "" && viewPrivHex == "" && spendPubHex == "":
+		if !wallet.ValidateMnemonic(mnemonic) {
+			return nil, fmt.Errorf("invalid mnemonic phrase")
+		}
+		return func(path string, password []byte) (*wallet.Wallet, error) {
+			return wallet.NewWalletFromMnemonic(path, password, mnemonic, defaultWalletConfig())
+		}, nil
+
+	case mnemonic == "" && spendPrivHex != "" && viewPrivHex != "" && spendPubHex == "":
+		spendPriv, err := parseHex32(spendPrivHex)
+		if err != nil {
+			return nil, fmt.Errorf("invalid spend_priv: %w", err)
+		}
+		viewPriv, err := parseHex32(viewPrivHex)
+		if err != nil {
+			return nil, fmt.Errorf("invalid view_priv: %w", err)
+		}
+		spendPub, err := ScalarToPubKey(spendPriv)
+		if err != nil {
+			return nil, fmt.Errorf("invalid spend_priv: %w", err)
+		}
+		viewPub, err := ScalarToPubKey(viewPriv)
+		if err != nil {
+			return nil, fmt.Errorf("invalid view_priv: %w", err)
+		}
+		keys := wallet.StealthKeys{SpendPrivKey: spendPriv, SpendPubKey: spendPub, ViewPrivKey: viewPriv, ViewPubKey: viewPub}
+		return func(path string, password []byte) (*wallet.Wallet, error) {
+			return wallet.NewWalletFromStealthKeys(path, password, keys, defaultWalletConfig())
+		}, nil
+
+	case mnemonic == "" && spendPrivHex == "" && viewPrivHex != "" && spendPubHex != "":
+		spendPub, err := parseHex32(spendPubHex)
+		if err != nil {
+			return nil, fmt.Errorf("invalid spend_pub: %w", err)
+		}
+		viewPriv, err := parseHex32(viewPrivHex)
+		if err != nil {
+			return nil, fmt.Errorf("invalid view_priv: %w", err)
+		}
+		viewPub, err := ScalarToPubKey(viewPriv)
+		if err != nil {
+			return nil, fmt.Errorf("invalid view_priv: %w", err)
+		}
+		keys := wallet.ViewOnlyKeys{SpendPubKey: spendPub, ViewPrivKey: viewPriv, ViewPubKey: viewPub}
+		return func(path string, password []byte) (*wallet.Wallet, error) {
+			return wallet.NewViewOnlyWallet(path, password, keys, defaultWalletConfig())
+		}, nil
+	}
+	return nil, fmt.Errorf("provide exactly one of: mnemonic, spend_priv + view_priv, or spend_pub + view_priv (view-only)")
+}
+
+func parseHex32(s string) ([32]byte, error) {
+	var out [32]byte
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) != 32 {
+		return out, fmt.Errorf("expected 64 hex chars")
+	}
+	copy(out[:], b)
+	return out, nil
 }
 
 // handleSeed returns the wallet recovery seed (BIP39 mnemonic).
@@ -1997,6 +2454,51 @@ func (s *APIServer) handleAudit(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleWalletOutputsAudit checks wallet outputs against the canonical chain.
+// POST /api/wallet/outputs/audit
+func (s *APIServer) handleWalletOutputsAudit(w http.ResponseWriter, r *http.Request) {
+	if !s.requireWallet(w, r) {
+		return
+	}
+
+	var req struct {
+		Repair bool `json:"repair"`
+	}
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			writeError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+	}
+
+	outputs := s.wallet.AllOutputs()
+	issues := auditWalletCanonicalOutputs(s.daemon.Chain(), outputs)
+
+	removedCount := 0
+	var removedAmount uint64
+	if req.Repair {
+		removed := removeWalletOutputIssues(s.wallet, issues)
+		removedCount = len(removed)
+		removedAmount = sumOwnedOutputs(removed)
+		if removedCount > 0 {
+			if err := s.wallet.Save(); err != nil {
+				writeInternal(w, r, http.StatusInternalServerError, "internal error", err)
+				return
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"total_outputs":   len(outputs),
+		"stale_outputs":   len(issues),
+		"stale_amount":    sumCanonicalOutputIssues(issues),
+		"repaired":        req.Repair,
+		"removed_outputs": removedCount,
+		"removed_amount":  removedAmount,
+		"issues":          issues,
+	})
+}
+
 // handleViewKeys returns the wallet's view-only keys (spend public, view private,
 // view public). Requires password confirmation and brute-force protection, like seed.
 // POST /api/wallet/viewkeys
@@ -2025,7 +2527,10 @@ func (s *APIServer) handleViewKeys(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Password string `json:"password"`
+		Password     string `json:"password"`
+		CreateFile   bool   `json:"create_file"`
+		FilePassword string `json:"file_password"`
+		Filename     string `json:"filename"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
@@ -2067,11 +2572,59 @@ func (s *APIServer) handleViewKeys(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Cache-Control", "no-store")
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"spend_pub": hex.EncodeToString(keys.SpendPubKey[:]),
 		"view_priv": hex.EncodeToString(keys.ViewPrivKey[:]),
 		"view_pub":  hex.EncodeToString(keys.ViewPubKey[:]),
-	})
+	}
+
+	// Optionally also write a loadable view-only wallet file (encrypted with its
+	// own file_password, never the main wallet password), so a single call can
+	// both reveal the keys and produce a watch-only wallet to move elsewhere.
+	if req.CreateFile {
+		if len(req.FilePassword) < 3 {
+			writeError(w, http.StatusBadRequest, "file_password must be at least 3 characters")
+			return
+		}
+		fileHash := passwordHash([]byte(req.FilePassword))
+		if subtle.ConstantTimeCompare(fileHash[:], expectedHash[:]) == 1 {
+			writeError(w, http.StatusBadRequest, "file_password must differ from the wallet password")
+			return
+		}
+
+		walletPath := deriveViewWalletFilename(s.cli.walletFilePath())
+		if req.Filename != "" {
+			base := filepath.Base(req.Filename)
+			if base == "." || base == "/" {
+				writeError(w, http.StatusBadRequest, "invalid filename")
+				return
+			}
+			if !strings.HasSuffix(base, ".wallet.dat") {
+				base += ".wallet.dat"
+			}
+			walletPath = filepath.Join(filepath.Dir(s.cli.walletFilePath()), base)
+		}
+
+		if _, err := os.Stat(walletPath); err == nil {
+			writeError(w, http.StatusConflict, "wallet file already exists: "+filepath.Base(walletPath))
+			return
+		}
+
+		filePw := []byte(req.FilePassword)
+		viewWallet, err := wallet.NewViewOnlyWallet(walletPath, filePw, keys, defaultWalletConfig())
+		wipeBytes(filePw)
+		if err != nil {
+			writeInternal(w, r, http.StatusInternalServerError, "failed to create view-only wallet", err)
+			return
+		}
+
+		resp["created"] = true
+		resp["filename"] = filepath.Base(walletPath)
+		resp["path"] = walletPath
+		resp["address"] = viewWallet.Address()
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleCertify verifies the entire chain for difficulty, timestamp, and linkage
@@ -2156,12 +2709,25 @@ func (s *APIServer) handleMiningStop(w http.ResponseWriter, r *http.Request) {
 // and submit back via POST /api/mining/submitblock.
 // GET /api/mining/blocktemplate
 func (s *APIServer) handleBlockTemplate(w http.ResponseWriter, r *http.Request) {
-	if s.wallet == nil {
+	// The wallet only supplies the default coinbase keys. A template paying an
+	// explicit ?address= is served without one, so a pool that passes its
+	// address gets work as soon as a restarted daemon's API is up instead of
+	// waiting for its wallet to finish loading.
+	overrideAddr := sanitizeInput(r.URL.Query().Get("address"))
+	s.mu.RLock()
+	loadedWallet := s.wallet
+	s.mu.RUnlock()
+	if loadedWallet == nil && overrideAddr == "" {
 		writeError(w, http.StatusServiceUnavailable, "no wallet loaded")
 		return
 	}
 
-	if s.daemon.syncMgr.IsSyncing() {
+	if !s.daemon.templateTipChecked() {
+		writeCodedError(w, http.StatusServiceUnavailable, "node_starting", "waiting for peer chain height, retry")
+		return
+	}
+
+	if s.daemon.syncMgr.IsSyncingFarBehind(blockTemplateSyncHeightTolerance) {
 		writeError(w, http.StatusServiceUnavailable, "node is syncing")
 		return
 	}
@@ -2169,32 +2735,38 @@ func (s *APIServer) handleBlockTemplate(w http.ResponseWriter, r *http.Request) 
 	// Read height, prevHash, and difficulty as a single atomic snapshot so a
 	// concurrent reorg cannot produce an inconsistent template.
 	tp := s.daemon.Chain().TemplateParams()
-	reward := GetBlockReward(tp.Height)
 
 	// Optionally override the coinbase destination (pool/dev-fee switching).
-	recipientSpendPub := s.wallet.SpendPubKey()
-	recipientViewPub := s.wallet.ViewPubKey()
-	rewardAddrUsed := s.wallet.Address()
-	if addr := sanitizeInput(r.URL.Query().Get("address")); addr != "" {
-		spendPub, viewPub, err := parseValidatedAddress(addr)
+	var recipientSpendPub, recipientViewPub [32]byte
+	var rewardAddrUsed string
+	if overrideAddr != "" {
+		spendPub, viewPub, err := parseValidatedAddress(overrideAddr)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid address")
 			return
 		}
 		recipientSpendPub = spendPub
 		recipientViewPub = viewPub
-		rewardAddrUsed = addr
+		rewardAddrUsed = overrideAddr
+	} else {
+		recipientSpendPub = loadedWallet.SpendPubKey()
+		recipientViewPub = loadedWallet.ViewPubKey()
+		rewardAddrUsed = loadedWallet.Address()
 	}
 
-	// Create coinbase paying to the selected reward address
-	coinbase, err := CreateCoinbase(recipientSpendPub, recipientViewPub, reward, tp.Height)
+	// Create coinbase paying to the selected reward address, then start the one
+	// the next height's first template will need.
+	coinbase, err := s.templateCoinbases.take(coinbaseKey{recipientSpendPub, recipientViewPub, tp.Height})
 	if err != nil {
 		writeInternal(w, r, http.StatusInternalServerError, "internal error", err)
 		return
 	}
+	s.templateCoinbases.prebuild(coinbaseKey{recipientSpendPub, recipientViewPub, tp.Height + 1})
 
-	// Get mempool transactions sorted by fee rate
-	txs := s.daemon.Mempool().GetTransactionsForBlock(MaxBlockSize-1000, 1000)
+	// Get mempool transactions sorted by fee rate together with the exact
+	// generation represented by this selection.
+	txs, mempoolGeneration := s.daemon.Mempool().GetTransactionsForBlockSnapshot(blockSpaceForTransactions(coinbase.Tx), 1000)
+	txs = s.daemon.Mempool().KeepSpendableOnChain(txs)
 
 	// Build transaction list (coinbase first)
 	allTxs := make([]*Transaction, 0, len(txs)+1)
@@ -2207,7 +2779,7 @@ func (s *APIServer) handleBlockTemplate(w http.ResponseWriter, r *http.Request) 
 			Version:    1,
 			Height:     tp.Height,
 			PrevHash:   tp.PrevHash,
-			Timestamp:  time.Now().Unix(),
+			Timestamp:  s.daemon.Chain().templateTimestamp(tp.PrevHash, time.Now().Unix()),
 			Difficulty: tp.Difficulty,
 			Nonce:      0,
 		},
@@ -2224,14 +2796,68 @@ func (s *APIServer) handleBlockTemplate(w http.ResponseWriter, r *http.Request) 
 
 	// Compute target for PoW validation
 	target := DifficultyToTarget(block.Header.Difficulty)
-	templateID := s.rememberMiningTemplate(block)
+	templateID, expiresAt, err := s.rememberMiningTemplateLease(block)
+	if err != nil {
+		switch {
+		case errors.Is(err, errMiningTemplateCacheFull):
+			var capacityErr *miningTemplateCacheFullError
+			if errors.As(err, &capacityErr) {
+				w.Header().Set("Retry-After", strconv.FormatInt(capacityErr.retryAfterSeconds, 10))
+			}
+			writeCodedError(w, http.StatusServiceUnavailable, "mining_template_cache_full", "mining template cache full, retry after a lease expires or the chain tip changes")
+		case errors.Is(err, errMiningTemplateStale):
+			writeCodedError(w, http.StatusServiceUnavailable, "mining_template_tip_changed", "chain tip changed while building template, retry")
+		default:
+			writeInternal(w, r, http.StatusInternalServerError, "internal error", err)
+		}
+		return
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"block":               block,
-		"target":              fmt.Sprintf("%x", target),
-		"header_base":         fmt.Sprintf("%x", block.Header.SerializeForPoW()),
-		"reward_address_used": rewardAddrUsed,
-		"template_id":         templateID,
+		"block":                       block,
+		"target":                      fmt.Sprintf("%x", target),
+		"header_base":                 fmt.Sprintf("%x", block.Header.SerializeForPoW()),
+		"reward_address_used":         rewardAddrUsed,
+		"template_id":                 templateID,
+		"template_expires_at_unix_ms": expiresAt.UnixMilli(),
+		"mempool_generation":          mempoolGeneration,
+	})
+}
+
+// handleRenewBlockTemplate extends the compact-submission lease for a template
+// that is still live and still builds directly on the current canonical tip.
+// POST /api/mining/renewtemplate
+func (s *APIServer) handleRenewBlockTemplate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		TemplateID string `json:"template_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	templateID := strings.TrimSpace(req.TemplateID)
+	if templateID == "" {
+		writeError(w, http.StatusBadRequest, "template_id is required")
+		return
+	}
+
+	expiresAt, err := s.renewMiningTemplate(templateID)
+	if err != nil {
+		switch {
+		case errors.Is(err, errMiningTemplateUnavailable):
+			writeError(w, http.StatusNotFound, "unknown or expired template_id")
+		case errors.Is(err, errMiningTemplateStale):
+			writeError(w, http.StatusConflict, "template no longer builds on current tip")
+		default:
+			writeInternal(w, r, http.StatusInternalServerError, "internal error", err)
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"template_id":                 templateID,
+		"template_expires_at_unix_ms": expiresAt.UnixMilli(),
 	})
 }
 
@@ -2346,40 +2972,40 @@ func (s *APIServer) catchUpScan() {
 	}
 
 	ctx := s.cli.ctx
-
-	walletHeight := w.SyncedHeight()
-	chainHeight := s.daemon.Chain().Height()
-	if walletHeight >= chainHeight {
-		return
+	removed := s.cli.rewindScannedWallet(w)
+	if removed > 0 {
+		if err := s.cli.saveScannedWallet(w); err != nil {
+			log.Printf("Warning: catchUpScan reorg save: %v", err)
+		}
 	}
 
-	for h := walletHeight + 1; h <= chainHeight; h++ {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		block := s.daemon.Chain().GetBlockByHeight(h)
-		if block == nil {
-			break
-		}
-		applyBlockToWallet(s.daemon.Chain(), w, sc, block)
-		w.ReconcileUnconfirmedSpends(func(txID [32]byte) bool {
-			return s.daemon.Mempool().HasTransaction(txID)
-		})
-
-		if h%100 == 0 || h == chainHeight {
-			if err := w.Save(); err != nil {
-				log.Printf("Warning: catchUpScan save at height %d: %v", h, err)
+	// While this runs the live block loop skips scanning; every step goes
+	// through syncWalletStep under walletScanMu and re-reads the chain tip, so
+	// blocks arriving meanwhile are picked up here. It stops once the wallet
+	// is unloaded or replaced.
+	catchUp := func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			if !s.cli.scanWalletStep(w, sc) {
+				return
+			}
+			if h := w.SyncedHeight(); h%100 == 0 || h == s.daemon.Chain().Height() {
+				if err := s.cli.saveScannedWallet(w); err != nil {
+					log.Printf("Warning: catchUpScan save at height %d: %v", h, err)
+				}
 			}
 		}
-
-		// Re-read chain height in case new blocks arrived during scan
-		if h == chainHeight {
-			chainHeight = s.daemon.Chain().Height()
-		}
 	}
+	s.cli.walletCatchUps.Add(1)
+	catchUp()
+	s.cli.walletCatchUps.Add(-1)
+	// A block the live loop skipped just before the count dropped is scanned
+	// here; later blocks are the live loop's again.
+	catchUp()
 }
 
 // ============================================================================
@@ -2408,10 +3034,16 @@ func (s *APIServer) handlePurgeData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	settingsData, settingsErr := os.ReadFile(settingsPath(s.dataDir))
 	// Remove data directory
 	if err := os.RemoveAll(s.dataDir); err != nil {
 		writeInternal(w, r, http.StatusInternalServerError, "internal error", err)
 		return
+	}
+	if settingsErr == nil {
+		if err := os.MkdirAll(s.dataDir, 0o700); err == nil {
+			_ = os.WriteFile(settingsPath(s.dataDir), settingsData, 0o600)
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -2450,6 +3082,12 @@ func encodeJSONResponse(v any) ([]byte, error) {
 // writeError writes a JSON error response.
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// writeCodedError adds a stable machine-readable code while preserving the
+// existing human-readable error field for backward-compatible clients.
+func writeCodedError(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, map[string]string{"code": code, "error": msg})
 }
 
 // writeInternal logs err server-side and returns a generic client-facing error.
@@ -2619,63 +3257,32 @@ type walletSendChainState struct {
 	inMempool     bool
 }
 
-func (s *APIServer) walletSendChainStates(txIDs [][32]byte, chainHeight uint64) map[[32]byte]walletSendChainState {
+func (s *APIServer) walletSendChainStates(txIDs [][32]byte, chainHeight uint64) (map[[32]byte]walletSendChainState, error) {
 	states := make(map[[32]byte]walletSendChainState, len(txIDs))
-	pending := make(map[[32]byte]struct{}, len(txIDs))
-
-	for _, txID := range txIDs {
-		if s.daemon.Mempool().HasTransaction(txID) {
-			states[txID] = walletSendChainState{chainState: "mempool", inMempool: true}
-			continue
-		}
-		pending[txID] = struct{}{}
-	}
-
-	storage := s.daemon.Chain().Storage()
-	if storage != nil && len(pending) > 0 {
-	scan:
-		for height := chainHeight; ; height-- {
-			hash, found := storage.GetBlockHashByHeight(height)
-			if !found {
-				if height == 0 {
-					break
-				}
-				continue
-			}
-
-			block, err := storage.GetBlock(hash)
-			if err == nil && block != nil {
-				for _, tx := range block.Transactions {
-					txID, _ := tx.TxID()
-					if _, ok := pending[txID]; !ok {
-						continue
-					}
-
-					confirmations := uint64(0)
-					if chainHeight >= height {
-						confirmations = chainHeight - height + 1
-					}
-					states[txID] = walletSendChainState{
-						chainState:    "confirmed",
-						confirmations: confirmations,
-					}
-					delete(pending, txID)
-					if len(pending) == 0 {
-						break scan
-					}
-				}
-			}
-
-			if height == 0 {
-				break
-			}
+	pending := make([][32]byte, 0, len(txIDs))
+	for _, id := range txIDs {
+		if s.daemon.Mempool().HasTransaction(id) {
+			states[id] = walletSendChainState{chainState: "mempool", inMempool: true}
+		} else {
+			pending = append(pending, id)
 		}
 	}
-
-	for txID := range pending {
-		states[txID] = walletSendChainState{chainState: "not_found"}
+	confirmed := map[[32]byte]uint64{}
+	if storage := s.daemon.Chain().Storage(); storage != nil && len(pending) > 0 {
+		var err error
+		confirmed, err = storage.CanonicalTransactionHeights(pending)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return states
+	for _, id := range pending {
+		if height, ok := confirmed[id]; ok && height <= chainHeight {
+			states[id] = walletSendChainState{chainState: "confirmed", confirmations: chainHeight - height + 1}
+		} else {
+			states[id] = walletSendChainState{chainState: "not_found"}
+		}
+	}
+	return states, nil
 }
 
 // createTxBuilder creates a transaction builder wired to the daemon (same as CLI).
@@ -2738,6 +3345,7 @@ func (s *APIServer) createTxBuilder() *wallet.Builder {
 		RingSize:    RingSize,
 		MinFee:      sendMinFee,
 		FeePerByte:  sendFeePerByte,
+		Parallelism: runtime.GOMAXPROCS(0),
 	}
 
 	return wallet.NewBuilder(s.wallet, cfg)
